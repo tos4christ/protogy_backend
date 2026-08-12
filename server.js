@@ -11,23 +11,17 @@ const cors = require('cors');
 const routes = require('./routes');
 const hooks = require('./hooks');
 const { router: authRoutes, requireAuth } = require('./auth');
+const amiRoutes = require('./ami');
+const nercRoutes = require('./nerc');
+const { router: settingsRoutes } = require('./settings');
 const ingest = require('./mqttIngest');
 const live = require('./live');
 const pool = require('./db');
-const amiRoutes = require('./ami');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 app.use((req, _res, next) => { console.log(req.method, req.url); next(); });
-
-// SSL domain-control validation (HTTPS side)
-// Files placed in backend\pki-validation\ are served at
-// https://<host>/.well-known/pki-validation/<filename>
-app.use('/.well-known/pki-validation',
-  express.static(path.join(__dirname, 'pki-validation')));
-
-app.use('/api/ami', amiRoutes);
 
 // public endpoints
 app.get('/api/health', async (_req, res) => {
@@ -40,7 +34,20 @@ app.use('/api/auth', authRoutes);
 app.use('/api/hooks', hooks);
 
 // protected API
+app.use('/api/ami', amiRoutes);
+app.use('/api/nerc', nercRoutes);      // regulator dashboard + Excel reports
+app.use('/api/settings', settingsRoutes);   // customer portal + prepaid device REST API
 app.use('/api', requireAuth, routes);
+
+// Optional SECOND frontend (a parallel UI) served under /v2.
+// Place its production build at  ..\frontend-v2\build  and it appears at
+// https://<host>/v2/  alongside the main app. Both share the same /api.
+const buildDirV2 = path.join(__dirname, '..', 'frontend-v2', 'build');
+if (fs.existsSync(buildDirV2)) {
+  app.use('/v2', express.static(buildDirV2));
+  app.get('/v2/*', (_req, res) => res.sendFile(path.join(buildDirV2, 'index.html')));
+  console.log('Serving second frontend from', buildDirV2, 'at /v2');
+}
 
 // serve the React production build (npm run build in frontend/)
 const buildDir = path.join(__dirname, '..', 'frontend', 'build');
@@ -66,18 +73,7 @@ if (certFile && keyFile) {
   live.attach(httpsServer);
   httpsServer.listen(httpsPort, () => console.log(`HTTPS on :${httpsPort}`));
   // redirect plain HTTP -> HTTPS
-  // redirect plain HTTP -> HTTPS, EXCEPT domain-validation files (CAs fetch
-  // these over plain HTTP and refuse redirects)
   http.createServer((req, res) => {
-    if (req.url.startsWith('/.well-known/pki-validation/')) {
-      const file = path.join(__dirname, 'pki-validation',
-        path.basename(req.url.split('?')[0])); // basename blocks path tricks
-      if (fs.existsSync(file)) {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        return res.end(fs.readFileSync(file));
-      }
-      res.writeHead(404); return res.end('not found');
-    }
     const host = (req.headers.host || '').split(':')[0];
     res.writeHead(301, { Location: `https://${host}${req.url}` });
     res.end();

@@ -22,18 +22,20 @@ const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
 // auto_registered meters.
 // ---------------------------------------------------------------------------
 router.post('/meters', requireAdmin, ah(async (req, res) => {
-  const { meterId, feederName, location, intervalSeconds, user, metadata, controllerId, disco, latitude, longitude } = req.body;
+  const { meterId, feederName, location, intervalSeconds, user, metadata, controllerId, disco, latitude, longitude,
+    station, motherFeeder, category, state, voltageClass, nominalVoltage } = req.body;
   if (!meterId || !feederName) {
     return res.status(400).json({ error: 'meterId and feederName are required' });
   }
-  console.log(meterId, feederName, location, intervalSeconds, user, metadata, controllerId, disco, latitude, longitude)
   const { rows } = await pool.query(
-    'SELECT * FROM onboard_meter($1,$2,$3,$4,$5,$6,$7,$8)',
+    'SELECT * FROM onboard_meter($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)',
     [meterId, feederName, location || null, intervalSeconds || 15, user || null,
      JSON.stringify(metadata || {}), controllerId || null, disco || null,
-    //  latitude != null && latitude !== '' ? +latitude : null,
-    //  longitude != null && longitude !== '' ? +longitude : null
-    ]
+     latitude != null && latitude !== '' ? +latitude : null,
+     longitude != null && longitude !== '' ? +longitude : null,
+     station || null, motherFeeder || null, category || null, state || null,
+     voltageClass || null,
+     nominalVoltage != null && nominalVoltage !== '' ? +nominalVoltage : null]
   );
   res.status(201).json(rows[0]);
 }));

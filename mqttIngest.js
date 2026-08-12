@@ -43,7 +43,7 @@ function normalizePayload(raw) {
   // Some vendors nest the readings under "params" (or "payload") instead of
   // "data" - alias them so every nested-format branch below applies unchanged.
   if (raw && !raw.data) {
-    if (raw.params && typeof raw.params === 'object') raw = { ...raw, data: raw.params };
+    if (raw.params && typeof raw.params === 'object' && !Array.isArray(raw.params)) raw = { ...raw, data: raw.params };
     else if (raw.payload && typeof raw.payload === 'object') raw = { ...raw, data: raw.payload };
   }
   // Format C: nested "data" with space-separated keys, epoch-ms "ts", no DevEUI
@@ -72,12 +72,12 @@ function normalizePayload(raw) {
       voltage_l1: num(d['Voltage V12']), voltage_l2: num(d['Voltage V23']),
       voltage_l3: num(d['Voltage V31']),
       current_l1: num(d.Current1), current_l2: num(d.Current2), current_l3: num(d.Current3),
-      frequency: num(d.Frequency) ?? num(d['FREQUENCY']),
+      frequency: num(d.Frequency) ?? num(d.FREQUENCY) ?? num(d['Frequency Hz']),
       power_factor: pf.length ? +(pf.reduce((a, b) => a + b, 0) / pf.length).toFixed(3) : null,
       active_power: kw.length ? +kw.reduce((a, b) => a + b, 0).toFixed(2) : num(d['Active Power kW']),
-      reactive_power: num(d['Reactive Power VAR1']) ?? null,
-      apparent_power: num(d['Apparent Power KVA1']) ?? null,
-      active_energy: num(d['Active Energy kWh']) ?? num(d['Total Export KWh']) ?? null,
+      reactive_power: num(d['Reactive Power kVAr']) ?? null,
+      apparent_power: num(d['Apparent Power kVA']) ?? null,
+      active_energy: num(d['Active Energy kWh']) ?? num(d['Energy kWh']) ?? null,
       reactive_energy: num(d['Reactive Energy kVArh']) ?? null,
       apparent_energy: num(d['Apparent Energy kVAh']) ?? null,
       status: num(d.Status) ?? null, exti_trigger: 0,
@@ -184,18 +184,24 @@ function start() {
         // identify its meter: meter_id | meterId | id | serial | DevEUI.
         const list = Array.isArray(raw) ? raw
           : Array.isArray(raw.meters) ? raw.meters
+          : Array.isArray(raw.params) ? raw.params
           : Array.isArray(raw.data) ? raw.data : null;
         if (list) {
           // batch style: many meters in one publish
           for (const entry of list) {
-            const mid = entry.DevEUI || entry.meter_id || entry.meterId || entry.id || entry.serial;
+            const mid = entry.DevEUI || entry.device_id || entry.deviceId
+              || entry.meter_id || entry.meterId || entry.id || entry.serial;
             if (!mid) { logBadPayload(topic, JSON.stringify(entry), 'batch entry missing meter id'); continue; }
-            enqueue(String(mid), controllerId, entry, receivedTs, topic);
+            const hasOwnTs = entry.ts || entry.time || entry.timestamp
+              || (entry.data && (entry.data.ts || entry.data.timestamp));
+            const withTs = hasOwnTs ? entry : { ...entry, ts: raw.ts || raw.time };
+            enqueue(String(mid), controllerId, withTs, receivedTs, topic);
           }
         } else {
           // sequential style: ONE meter payload per publish (transmission cycle,
           // e.g. every 2s). DevEUI identifies the meter and becomes meter_id.
           const mid = raw.DevEUI || (raw.data && raw.data.DevEUI)
+            || raw.device_id || raw.deviceId
             || raw.meter_id || raw.meterId || raw.id || raw.serial
             || controllerId; // no id in payload -> single-meter gateway: use controller id
           enqueue(String(mid), controllerId, raw, receivedTs, topic);
