@@ -42,7 +42,9 @@ app.use('/api', requireAuth, routes);
 // Optional SECOND frontend (a parallel UI) served under /v2.
 // Place its production build at  ..\frontend-v2\build  and it appears at
 // https://<host>/v2/  alongside the main app. Both share the same /api.
-const buildDirV2 = path.join(__dirname, '..', 'frontend-v2', 'build');
+
+// const buildDirV2 = path.join(__dirname, '..', 'frontend-v2', 'build');
+const buildDirV2 = path.join(__dirname, 'build-v2');
 if (fs.existsSync(buildDirV2)) {
   app.use('/v2', express.static(buildDirV2));
   app.get('/v2/*', (_req, res) => res.sendFile(path.join(buildDirV2, 'index.html')));
@@ -50,7 +52,8 @@ if (fs.existsSync(buildDirV2)) {
 }
 
 // serve the React production build (npm run build in frontend/)
-const buildDir = path.join(__dirname, '..', 'frontend', 'build');
+// const buildDir = path.join(__dirname, '..', 'frontend', 'build');
+const buildDir = path.join(__dirname, 'build');
 if (fs.existsSync(buildDir)) {
   app.use(express.static(buildDir));
   app.get('*', (req, res, next) => {

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 210 60" width="210" height="60">
+  <ellipse cx="30" cy="34" rx="22" ry="18" fill="none" stroke="#b8bdc4" stroke-width="6"/>
+  <path d="M10 28 Q30 10 52 24" fill="none" stroke="#e8452c" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="46" cy="18" r="5" fill="#7ec8e3"/>
+  <text x="62" y="28" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="700" fill="#7ec8e3">Protogy</text>
+  <text x="62" y="48" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="700" fill="#c0392b">Global Services LTD</text>
+</svg>
