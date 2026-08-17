@@ -326,7 +326,7 @@ router.get('/dashboard/overview', ah(async (req, res) => {
   if (req.query.disco) { params.push(req.query.disco); discoCond = ` WHERE s.disco = $1`; }
   const { rows } = await pool.query(
     `SELECT s.meter_id, s.feeder_name, s.disco, s.connectivity, s.onboarding_status,
-            s.last_reading_at, s.active_power, s.frequency,
+            s.last_reading_at, s.active_power, s.reactive_power, s.power_factor, s.frequency,
             COALESCE(d.dar_pct, 0)        AS dar_today,
             COALESCE(d.received_count, 0) AS received_today,
             COALESCE(d.buffered_count, 0) AS buffered_today

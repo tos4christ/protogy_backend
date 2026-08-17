@@ -134,6 +134,53 @@ router.get('/summary-table', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// GET /api/nerc/compliance?date=YYYY-MM-DD
+// Compliance level (current uptime / 24h) per FEEDER, plus per-Disco averages.
+// ---------------------------------------------------------------------------
+router.get('/compliance', ah(async (req, res) => {
+  const cfg = await getSettings();
+  const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
+  const { rows } = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco,
+      COALESCE(d.dar_pct, 0) AS dar_pct,
+      LEAST(24, COALESCE(u.cur_on, 0) * s.expected_interval_s / 3600.0)  AS current_uptime_h,
+      LEAST(24, COALESCE(u.volt_on, 0) * s.expected_interval_s / 3600.0) AS voltage_uptime_h
+    FROM v_meter_status s
+    LEFT JOIN v_dar_daily d ON d.meter_id = s.meter_id AND d.day = $1::date
+    LEFT JOIN (
+      SELECT meter_id, sum(current_on_count) cur_on, sum(voltage_on_count) volt_on
+      FROM agg_nerc_15min
+      WHERE bucket >= $1::date AND bucket < $1::date + interval '1 day'
+      GROUP BY meter_id) u ON u.meter_id = s.meter_id
+    ORDER BY s.disco NULLS LAST, s.feeder_name`, [date]);
+
+  const feeders = rows.map((r) => {
+    const compliance = +(+r.current_uptime_h / 24 * 100).toFixed(1);
+    return {
+      meterId: r.meter_id, feeder: r.feeder_name || r.meter_id, disco: r.disco,
+      darPct: +(+r.dar_pct).toFixed(1),
+      currentUptimeH: +(+r.current_uptime_h).toFixed(1),
+      voltageUptimeH: +(+r.voltage_uptime_h).toFixed(1),
+      compliancePct: compliance,
+      status: compliance >= +cfg.compliance_met_pct ? 'Met' : 'Not Met',
+    };
+  });
+  const byDisco = {};
+  feeders.forEach((f) => {
+    const k = f.disco || 'Unassigned';
+    (byDisco[k] = byDisco[k] || []).push(f);
+  });
+  const discos = Object.entries(byDisco).map(([disco, list]) => ({
+    disco,
+    feeders: list.length,
+    avgCompliancePct: +(list.reduce((a, f) => a + f.compliancePct, 0) / list.length).toFixed(1),
+    avgDarPct: +(list.reduce((a, f) => a + f.darPct, 0) / list.length).toFixed(1),
+    met: list.filter((f) => f.status === 'Met').length,
+  }));
+  res.json({ date, metThresholdPct: +cfg.compliance_met_pct, discos, feeders });
+}));
+
+// ---------------------------------------------------------------------------
 // Excel helpers
 // ---------------------------------------------------------------------------
 function sheetHeader(ws, title, rangeText, columns) {
