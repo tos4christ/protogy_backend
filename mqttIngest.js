@@ -222,9 +222,9 @@ function start() {
           enqueue(String(mid), controllerId, raw, receivedTs, topic);
         }
       }
-      if(topic === 'powertechfeeder/messagetopic' && raw && raw.DevEUI == 'a8404170b45a0ac5') {
-        console.log(batch, '  batch after enqueue for  ', topic, raw.DevEUI);
-      }
+      // if(topic === 'powertechfeeder/messagetopic' && raw && raw.DevEUI == 'a8404170b45a0ac5') {
+      //   console.log(batch, '  batch after enqueue for  ', topic, raw.DevEUI);
+      // }
       if (batch.length >= 500) flush(topic, raw);
     } catch (err) {
       stats.badPayloads++;
@@ -284,9 +284,9 @@ async function flush(topic, raw) {
     
     const r = await pool.query(sql, params);
 
-    if(topic === 'powertechfeeder/messagetopic' && raw && raw.DevEUI == 'a8404170b45a0ac5') {
-      console.log(sql, params, " then finally ", r);
-    }
+    // if(topic === 'powertechfeeder/messagetopic' && raw && raw.DevEUI == 'a8404170b45a0ac5') {
+    //   console.log(sql, params, " then finally ", r);
+    // }
 
     stats.inserted += r.rowCount;
     stats.lastFlush = new Date().toISOString();
