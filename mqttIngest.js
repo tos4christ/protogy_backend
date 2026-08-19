@@ -175,10 +175,6 @@ function start() {
       const raw = JSON.parse(message.toString());
       const receivedTs = new Date().toISOString();
 
-      if(topic === 'powertechfeeder/messagetopic') {
-        console.log('[raw] received raw batch message on', raw);
-      }
-
       // Route by topic shape:
       //   meters/<meter_id>/data          -> single reading, standalone meter
       //   gw/<controller>/<meter_id>/data -> single reading via controller
@@ -226,7 +222,10 @@ function start() {
           enqueue(String(mid), controllerId, raw, receivedTs, topic);
         }
       }
-      if (batch.length >= 500) flush();
+      if(topic === 'powertechfeeder/messagetopic' && raw && raw.DevEUI == 'a8404170b45a0ac5') {
+        console.log(batch, '  batch after enqueue for  ', topic, raw.DevEUI);
+      }
+      if (batch.length >= 500) flush(topic, raw);
     } catch (err) {
       stats.badPayloads++;
       console.error('[mqtt] bad payload on', topic, err.message);
@@ -267,7 +266,7 @@ function enqueue(meterId, controllerId, raw, receivedTs, topic) {
   }
 }
 
-async function flush() {
+async function flush(topic, raw) {
   if (batch.length === 0) return;
   const rows = batch;
   batch = [];
@@ -282,7 +281,13 @@ async function flush() {
                VALUES ${values.join(',')}
                ON CONFLICT (meter_id, meter_ts) DO NOTHING`;
   try {
+    
     const r = await pool.query(sql, params);
+
+    if(topic === 'powertechfeeder/messagetopic' && raw && raw.DevEUI == 'a8404170b45a0ac5') {
+      console.log(sql, params, " then finally ", r);
+    }
+
     stats.inserted += r.rowCount;
     stats.lastFlush = new Date().toISOString();
   } catch (err) {
