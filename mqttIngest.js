@@ -165,9 +165,15 @@ function start() {
   client.on('error', (e) => console.error('[mqtt] error:', e.message));
 
   client.on('message', (topic, message) => {
+    if(topic === 'powertechfeeder/messagetopic') {
+      console.log('[mqtt] received batch message on', topic, message.toString().slice(0, 200), '...');
+    }
     stats.received++;
     try {
       const parts = topic.split('/');
+      if(topic === 'powertechfeeder/messagetopic') {
+        console.log('[parts] received batch message on', parts);
+      }
       const raw = JSON.parse(message.toString());
       const receivedTs = new Date().toISOString();
 
@@ -176,6 +182,28 @@ function start() {
       //   gw/<controller>/<meter_id>/data -> single reading via controller
       //   gw/<controller>/data            -> BATCH: readings for many meters
       //   powertechfeeder/messagetopic    -> BATCH: readings for many meters
+      if (parts[0] === 'powertechfeeder' && parts[1] === 'messagetopic') {
+        // Accept {meters:[...]}, {data:[...]} or a bare array. Each entry must
+        // identify its meter: meter_id | meterId | id | serial | DevEUI.
+        const list = Array.isArray(raw) ? raw
+          : Array.isArray(raw.meters) ? raw.meters
+          : Array.isArray(raw.params) ? raw.params
+          : Array.isArray(raw.data) ? raw.data : null;
+        if (list) {
+          // batch style: many meters in one publish
+          for (const entry of list) {
+            const mid = entry.DevEUI || entry.device_id || entry.deviceId
+              || entry.meter_id || entry.meterId || entry.id || entry.serial;
+            if (!mid) { logBadPayload(topic, JSON.stringify(entry), 'batch entry missing meter id'); continue; }
+            const hasOwnTs = entry.ts || entry.time || entry.timestamp
+              || (entry.data && (entry.data.ts || entry.data.timestamp));
+            const withTs = hasOwnTs ? entry : { ...entry, ts: raw.ts || raw.time };
+            enqueue(String(mid), null, withTs, receivedTs, topic);
+          }
+        } else {
+          logBadPayload(topic, JSON.stringify(raw), 'batch missing array of meters');
+        }
+      }
       if (parts[0] === 'meters' && parts.length === 3) {
         enqueue(parts[1], null, raw, receivedTs, topic);
       } else if (parts[0] === 'gw' && parts.length === 4) {
