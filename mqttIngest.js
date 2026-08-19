@@ -198,7 +198,8 @@ function start() {
             const hasOwnTs = entry.ts || entry.time || entry.timestamp
               || (entry.data && (entry.data.ts || entry.data.timestamp));
             const withTs = hasOwnTs ? entry : { ...entry, ts: raw.ts || raw.time };
-            enqueue(String(mid), null, withTs, receivedTs, topic);
+            console.log(withTs, " From Powertech");
+            enqueue(String(mid), String(mid), withTs, receivedTs, topic);
           }
         } else {
           logBadPayload(topic, JSON.stringify(raw), 'batch missing array of meters');
