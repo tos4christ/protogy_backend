@@ -184,28 +184,13 @@ function start() {
       //   gw/<controller>/<meter_id>/data -> single reading via controller
       //   gw/<controller>/data            -> BATCH: readings for many meters
       //   powertechfeeder/messagetopic    -> BATCH: readings for many meters
-      if (parts[0] === 'powertechfeeder' && parts[1] === 'messagetopic') {
-        // Accept {meters:[...]}, {data:[...]} or a bare array. Each entry must
-        // identify its meter: meter_id | meterId | id | serial | DevEUI.
-        const list = Array.isArray(raw) ? raw
-          : Array.isArray(raw.meters) ? raw.meters
-          : Array.isArray(raw.params) ? raw.params
-          : Array.isArray(raw.data) ? raw.data : null;
+
+      if (parts[0] === 'powertechfeeder' && parts[1] === 'messagetopic') {        
           
-        if (list) {
-          // batch style: many meters in one publish
-          for (const entry of list) {
-            const mid = entry.DevEUI || entry.device_id || entry.deviceId
-              || entry.meter_id || entry.meterId || entry.id || entry.serial;
-            if (!mid) { logBadPayload(topic, JSON.stringify(entry), 'batch entry missing meter id'); continue; }
-            const hasOwnTs = entry.ts || entry.time || entry.timestamp
-              || (entry.data && (entry.data.ts || entry.data.timestamp));
-            const withTs = hasOwnTs ? entry : { ...entry, ts: raw.ts || raw.time };
-            console.log(withTs, " From Powertech");
-            enqueue(String(mid), String(mid), withTs, receivedTs, topic);
-          }
+        if (raw && raw.DevEUI) {
+          enqueue(raw.DevEUI, raw.DevEUI, raw, receivedTs, topic);
         } else {
-          logBadPayload(topic, JSON.stringify(raw), 'batch missing array of meters');
+          logBadPayload(topic, JSON.stringify(raw), 'batch missing DevEUI');
         }
       }
       if (parts[0] === 'meters' && parts.length === 3) {
