@@ -160,6 +160,7 @@ function start() {
     client.subscribe(process.env.MQTT_TOPIC || 'meters/+/data', { qos: 1 });
     client.subscribe('gw/+/+/data', { qos: 1 });  // controller per-meter topics
     client.subscribe('gw/+/data', { qos: 1 });    // controller batch topic
+    client.subscribe('powertechfeeder/messagetopic', { qos: 1 });    // controller batch topic
   });
   client.on('error', (e) => console.error('[mqtt] error:', e.message));
 
@@ -174,6 +175,7 @@ function start() {
       //   meters/<meter_id>/data          -> single reading, standalone meter
       //   gw/<controller>/<meter_id>/data -> single reading via controller
       //   gw/<controller>/data            -> BATCH: readings for many meters
+      //   powertechfeeder/messagetopic    -> BATCH: readings for many meters
       if (parts[0] === 'meters' && parts.length === 3) {
         enqueue(parts[1], null, raw, receivedTs, topic);
       } else if (parts[0] === 'gw' && parts.length === 4) {
