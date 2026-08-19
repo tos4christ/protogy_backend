@@ -166,16 +166,18 @@ function start() {
 
   client.on('message', (topic, message) => {
     if(topic === 'powertechfeeder/messagetopic') {
-      console.log('[mqtt] received batch message on', topic, message.toString().slice(0, 200), '...');
+      // console.log('[mqtt] received batch message on', topic, message.toString().slice(0, 200), '...');
     }
     stats.received++;
     try {
       const parts = topic.split('/');
-      if(topic === 'powertechfeeder/messagetopic') {
-        console.log('[parts] received batch message on', parts);
-      }
+      
       const raw = JSON.parse(message.toString());
       const receivedTs = new Date().toISOString();
+
+      if(topic === 'powertechfeeder/messagetopic') {
+        console.log('[raw] received raw batch message on', raw);
+      }
 
       // Route by topic shape:
       //   meters/<meter_id>/data          -> single reading, standalone meter
@@ -189,6 +191,7 @@ function start() {
           : Array.isArray(raw.meters) ? raw.meters
           : Array.isArray(raw.params) ? raw.params
           : Array.isArray(raw.data) ? raw.data : null;
+          
         if (list) {
           // batch style: many meters in one publish
           for (const entry of list) {
