@@ -89,7 +89,7 @@ function normalizePayload(raw) {
   if (raw && typeof raw.data === 'object' && raw.data !== null) {
     const d = raw.data;
     return {
-      timestamp: d.timestamp || raw.time || new Date().toISOString(),
+      timestamp: d.timestamp || d.time || raw.time || new Date().toISOString(),
       voltage_l1: num(d.V_L12), voltage_l2: num(d.V_L23), voltage_l3: num(d.V_L31),
       current_l1: num(d.A_L1), current_l2: num(d.A_L2), current_l3: num(d.A_L3),
       frequency: num(d.Frequency_Avg), power_factor: num(d.Power_Factor_Avg),
