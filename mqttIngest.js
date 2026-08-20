@@ -240,7 +240,7 @@ const seenControllerPairs = new Set();
 function enqueue(meterId, controllerId, raw, receivedTs, topic) {
   const p = normalizePayload(raw);
   if (topic === 'powertechfeeder/messagetopic' && raw) {
-    console.log('[mqtt] enqueue for  ', topic, meterId, ' normalized to ', p);
+    // console.log('[mqtt] enqueue for  ', topic, meterId, ' normalized to ', p);
   }
   if (!p) { return logBadPayload(topic, JSON.stringify(raw), 'unrecognized shape'); }
   live.broadcast({ type: 'reading', meterId, controllerId, receivedTs, data: p });
