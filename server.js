@@ -32,6 +32,8 @@ app.get('/api/health', async (_req, res) => {
 });
 app.use('/api/auth', authRoutes);
 app.use('/api/hooks', hooks);
+// SSL provider domain-validation file — intentionally public, no auth.
+app.use('/.well-known', express.static(path.join(__dirname, '.well-known')));
 
 // protected API
 app.use('/api/ami', amiRoutes);
