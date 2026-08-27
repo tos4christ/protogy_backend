@@ -244,35 +244,48 @@ async function computeSbtScorecard(req) {
   }
   const meterIds = feeders.map((f) => f.meter_id);
 
-  // 14 trailing days of uptime, to count consecutive shortfall days ending
-  // at `date` without a separate query per feeder.
+  // Hours-supplied is measured the SAME way as the rest of the app's
+  // "current online" logic (cfg.current_flow_threshold), from agg_15min —
+  // NOT from agg_nerc_15min's separate, hardcoded 0.5A threshold, which
+  // could silently disagree with what Settings/the dashboard consider
+  // "current flowing" and made feeders look permanently non-compliant
+  // even with real, nonzero current on screen.
   const daily = await pool.query(`
-    SELECT meter_id, time_bucket('1 day', bucket)::date AS day, sum(current_on_count) AS on_count
-    FROM agg_nerc_15min
+    SELECT meter_id, time_bucket('1 day', bucket)::date AS day,
+      count(*) FILTER (WHERE GREATEST(avg_current_l1, avg_current_l2, avg_current_l3) > $3) AS on_buckets
+    FROM agg_15min
     WHERE meter_id = ANY($1) AND bucket >= $2::date - INTERVAL '13 days' AND bucket < $2::date + INTERVAL '1 day'
-    GROUP BY meter_id, day`, [meterIds, date]);
+    GROUP BY meter_id, day`, [meterIds, date, +cfg.current_flow_threshold]);
   const byMeterDay = {};
   daily.rows.forEach((r) => {
     const k = r.meter_id;
-    (byMeterDay[k] = byMeterDay[k] || {})[r.day.toISOString().slice(0, 10)] = +r.on_count;
+    // Each bucket is 15 minutes = 0.25h, regardless of the meter's own
+    // sampling interval — simpler and consistent across the fleet.
+    (byMeterDay[k] = byMeterDay[k] || {})[r.day.toISOString().slice(0, 10)] = +r.on_buckets * 0.25;
   });
 
   // Today's average measured load — the real, defensible basis for the
-  // revenue estimate (no assumed customer counts). Also doubles as a data
-  // sanity check: if a feeder shows 0 readings here despite live current/
-  // power elsewhere, its meter_id likely doesn't match what the device is
-  // actually sending (e.g. a duplicate row from re-onboarding).
+  // revenue estimate (no assumed customer counts). Also two data-quality
+  // sanity checks, distinguished so the right fix is obvious:
+  //  - readingsToday = 0            -> nothing reaching this meter_id at all
+  //    (often a duplicate/mismatched meter_id from re-onboarding).
+  //  - readingsToday > 0 but hasCurrent = false -> the device IS reporting
+  //    (e.g. voltage), but its current/CT channel isn't — a real device or
+  //    wiring issue on that meter, not a Protogy bug.
   const power = await pool.query(`
-    SELECT meter_id, avg(avg_active_power) AS avg_power, sum(received_count) AS readings_today
+    SELECT meter_id, avg(avg_active_power) AS avg_power, sum(received_count) AS readings_today,
+      bool_or(avg_current_l1 IS NOT NULL OR avg_current_l2 IS NOT NULL OR avg_current_l3 IS NOT NULL) AS has_current
     FROM agg_15min
     WHERE meter_id = ANY($1) AND bucket >= $2::date AND bucket < $2::date + interval '1 day'
       AND received_count > 0
     GROUP BY meter_id`, [meterIds, date]);
   const avgPowerByMeter = {};
   const readingsTodayByMeter = {};
+  const hasCurrentByMeter = {};
   power.rows.forEach((r) => {
     avgPowerByMeter[r.meter_id] = +r.avg_power;
     readingsTodayByMeter[r.meter_id] = +r.readings_today;
+    hasCurrentByMeter[r.meter_id] = r.has_current;
   });
 
   const dayList = [];
@@ -285,9 +298,9 @@ async function computeSbtScorecard(req) {
     const band = f.tariff_band;
     const need = minHours[band];
     const hoursFor = (day) => {
-      const onCount = (byMeterDay[f.meter_id] || {})[day];
-      if (onCount == null) return null;
-      return Math.min(24, onCount * f.expected_interval_s / 3600);
+      const h = (byMeterDay[f.meter_id] || {})[day];
+      if (h == null) return null;
+      return Math.min(24, h);
     };
     const actualHours = +(hoursFor(date) || 0).toFixed(1);
     const shortfallHours = need != null ? +Math.max(0, need - actualHours).toFixed(1) : null;
@@ -319,6 +332,7 @@ async function computeSbtScorecard(req) {
       avgLoadKW: avgPowerKW != null ? +avgPowerKW.toFixed(2) : null,
       revenueAtRiskNgn,
       readingsToday: readingsTodayByMeter[f.meter_id] || 0,
+      currentSensorMissing: (readingsTodayByMeter[f.meter_id] || 0) > 0 && !hasCurrentByMeter[f.meter_id],
     };
   });
 
@@ -525,7 +539,9 @@ router.get('/report/sbt-scorecard', ah(async (req, res) => {
       f.explanationDue ? 'YES' : '', f.downgradeRisk ? 'YES' : '',
       f.avgLoadKW != null ? f.avgLoadKW : 'N/A',
       f.revenueAtRiskNgn != null ? f.revenueAtRiskNgn : 'N/A',
-      f.readingsToday === 0 ? 'NO DATA — check meter_id' : f.readingsToday]);
+      f.readingsToday === 0 ? 'NO DATA — check meter_id'
+        : f.currentSensorMissing ? 'NO CURRENT SENSOR — check device/wiring'
+        : f.readingsToday]);
   });
   ws.columns.forEach((c, i) => { c.width = i < 3 ? 20 : 14; });
   await sendWb(res, wb, `SBT Compliance Scorecard ${result.date}.xlsx`);
