@@ -68,8 +68,22 @@ router.get('/discos', ah(async (_req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// FEATURE 4: Feeder status - all / online / offline
-// GET /api/meters/status?filter=all|online|offline
+// List of Tariff Bands in use (for filter dropdowns)
+// GET /api/bands
+// ---------------------------------------------------------------------------
+router.get('/bands', ah(async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT tariff_band AS band, count(*) AS feeders FROM meters
+     WHERE tariff_band IS NOT NULL AND status <> 'decommissioned'
+     GROUP BY tariff_band ORDER BY tariff_band`);
+  res.json(rows);
+}));
+
+// ---------------------------------------------------------------------------
+// FEATURE 4: Feeder status - all / online / offline, filterable by Disco and
+// Band, paginated so a fleet of thousands of feeders stays fast and compact
+// in the UI (page/limit query params; limit=all disables paging).
+// GET /api/meters/status?filter=all|online|offline&disco=&band=&page=&limit=
 // ---------------------------------------------------------------------------
 router.get('/meters/status', ah(async (req, res) => {
   const filter = (req.query.filter || 'all').toLowerCase();
@@ -78,13 +92,27 @@ router.get('/meters/status', ah(async (req, res) => {
   if (filter === 'online') conds.push("connectivity = 'online'");
   else if (filter === 'offline') conds.push("connectivity IN ('offline','never_reported')");
   if (req.query.disco) { params.push(req.query.disco); conds.push(`disco = $${params.length}`); }
+  if (req.query.band) { params.push(req.query.band); conds.push(`tariff_band = $${params.length}`); }
   let sql = 'SELECT * FROM v_meter_status';
   if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
   sql += ' ORDER BY feeder_name NULLS LAST, meter_id';
   const { rows } = await pool.query(sql, params);
   const counts = { online: 0, offline: 0, never_reported: 0 };
-  if (filter === 'all') rows.forEach((r) => { counts[r.connectivity] = (counts[r.connectivity] || 0) + 1; });
-  res.json({ filter, count: rows.length, counts: filter === 'all' ? counts : undefined, meters: rows });
+  rows.forEach((r) => { counts[r.connectivity] = (counts[r.connectivity] || 0) + 1; });
+
+  const total = rows.length;
+  const limitRaw = (req.query.limit || '').toLowerCase();
+  const limit = limitRaw === 'all' ? total : Math.min(1000, Math.max(1, +req.query.limit || 100));
+  const page = Math.max(1, +req.query.page || 1);
+  const totalPages = Math.max(1, Math.ceil(total / (limit || 1)));
+  const start = (Math.min(page, totalPages) - 1) * limit;
+  const pageRows = limitRaw === 'all' ? rows : rows.slice(start, start + limit);
+
+  res.json({
+    filter, count: total, counts,
+    page: Math.min(page, totalPages), limit: limitRaw === 'all' ? 'all' : limit, totalPages, total,
+    meters: pageRows,
+  });
 }));
 
 // ---------------------------------------------------------------------------
@@ -318,15 +346,20 @@ router.get('/meters/:id/download', ah(async (req, res) => {
 
 
 // ---------------------------------------------------------------------------
-// DASHBOARD OVERVIEW: fleet stats + today's DAR per feeder (for charts)
-// GET /api/dashboard/overview
+// DASHBOARD OVERVIEW: fleet stats + today's DAR per feeder (for charts),
+// filterable by Disco and Band, with a per-Band breakdown for grouped
+// analysis, and paginated feeders so a fleet of thousands stays fast and
+// the chart can be shown a compact page at a time.
+// GET /api/dashboard/overview?disco=&band=&page=&limit=
 // ---------------------------------------------------------------------------
 router.get('/dashboard/overview', ah(async (req, res) => {
   const params = [];
-  let discoCond = '';
-  if (req.query.disco) { params.push(req.query.disco); discoCond = ` WHERE s.disco = $1`; }
+  const conds = [];
+  if (req.query.disco) { params.push(req.query.disco); conds.push(`s.disco = $${params.length}`); }
+  if (req.query.band) { params.push(req.query.band); conds.push(`s.tariff_band = $${params.length}`); }
+  const whereCond = conds.length ? ` WHERE ${conds.join(' AND ')}` : '';
   const { rows } = await pool.query(
-    `SELECT s.meter_id, s.feeder_name, s.disco, s.connectivity, s.onboarding_status,
+    `SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.connectivity, s.onboarding_status,
             s.last_reading_at, s.active_power, s.reactive_power, s.power_factor, s.frequency,
             s.power_unit,
             COALESCE(d.dar_pct, 0)        AS dar_today,
@@ -334,7 +367,7 @@ router.get('/dashboard/overview', ah(async (req, res) => {
             COALESCE(d.buffered_count, 0) AS buffered_today
      FROM v_meter_status s
      LEFT JOIN v_dar_daily d
-       ON d.meter_id = s.meter_id AND d.day = current_date${discoCond}
+       ON d.meter_id = s.meter_id AND d.day = current_date${whereCond}
      ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
   const online = rows.filter((r) => r.connectivity === 'online').length;
   const offline = rows.filter((r) => r.connectivity === 'offline').length;
@@ -343,10 +376,42 @@ router.get('/dashboard/overview', ah(async (req, res) => {
   const fleetAvgDar = reporting.length
     ? +(reporting.reduce((s2, r) => s2 + +r.dar_today, 0) / reporting.length).toFixed(2)
     : 0;
+
+  // Per-Band roll-up, so the dashboard can group its analysis and chart by
+  // Band (e.g. "average DAR for Band A") instead of only per-feeder.
+  const byBand = {};
+  rows.forEach((r) => {
+    const k = r.tariff_band || 'Unassigned';
+    (byBand[k] = byBand[k] || []).push(r);
+  });
+  const bandSummary = Object.entries(byBand).map(([band, list]) => {
+    const rep = list.filter((r) => +r.received_today > 0);
+    return {
+      band,
+      feeders: list.length,
+      online: list.filter((r) => r.connectivity === 'online').length,
+      offline: list.filter((r) => r.connectivity !== 'online').length,
+      avgDarToday: rep.length
+        ? +(rep.reduce((s2, r) => s2 + +r.dar_today, 0) / rep.length).toFixed(1) : 0,
+    };
+  }).sort((a, b) => a.band.localeCompare(b.band));
+
+  // Paginate the per-feeder list that backs the chart/table, so thousands of
+  // feeders render one compact page at a time instead of one giant chart.
+  const total = rows.length;
+  const limitRaw = (req.query.limit || '').toLowerCase();
+  const limit = limitRaw === 'all' ? total : Math.min(500, Math.max(1, +req.query.limit || 50));
+  const page = Math.max(1, +req.query.page || 1);
+  const totalPages = Math.max(1, Math.ceil(total / (limit || 1)));
+  const start = (Math.min(page, totalPages) - 1) * limit;
+  const pageRows = limitRaw === 'all' ? rows : rows.slice(start, start + limit);
+
   res.json({
     generatedAt: new Date().toISOString(),
-    totals: { feeders: rows.length, online, offline, never_reported: never, fleetAvgDarToday: fleetAvgDar },
-    feeders: rows,
+    totals: { feeders: total, online, offline, never_reported: never, fleetAvgDarToday: fleetAvgDar },
+    bandSummary,
+    page: Math.min(page, totalPages), limit: limitRaw === 'all' ? 'all' : limit, totalPages, total,
+    feeders: pageRows,
   });
 }));
 
