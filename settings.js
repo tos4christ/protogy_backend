@@ -7,6 +7,20 @@ const router = express.Router();
 const DEFAULTS = {
   dar_compliance_pct: 95, compliance_met_pct: 95, voltage_tolerance_pct: 10,
   current_flow_threshold: 0.5, voltage_present_threshold: 50,
+  // Service-Based Tariff (SBT) minimum daily supply hours per NERC Band
+  // (NERC Order, effective 3 Apr 2024): A=20h, B=16h, C=12h, D=8h, E=4h.
+  sbt_hours_band_a: 20, sbt_hours_band_b: 16, sbt_hours_band_c: 12,
+  sbt_hours_band_d: 8, sbt_hours_band_e: 4,
+  // Estimated tariff (NGN/kWh) per Band, used ONLY to estimate revenue
+  // exposure from a supply shortfall. These vary by DisCo and month under
+  // NERC's monthly tariff review — treat as a rough planning figure, not an
+  // official rate, and update here to match your DisCo's current order.
+  sbt_tariff_band_a: 209.5, sbt_tariff_band_b: 180, sbt_tariff_band_c: 150,
+  sbt_tariff_band_d: 80, sbt_tariff_band_e: 40,
+  // NERC's Band A order: DisCo must publish an explanation after this many
+  // consecutive non-performing days, and the feeder is auto-downgraded
+  // after this many. Applied fleet-wide here as an early-warning signal.
+  sbt_explanation_days: 2, sbt_downgrade_days: 7,
 };
 
 async function getSettings() {

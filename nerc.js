@@ -206,6 +206,131 @@ router.get('/compliance', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// GET /api/nerc/sbt-scorecard?date=&disco=&band=
+// Service-Based Tariff compliance: for each feeder, actual supply hours vs
+// its Band's NERC-mandated minimum, consecutive shortfall days, and an
+// early-warning flag matching NERC's own Band-A order (explanation due
+// after N days, downgrade risk after M days). Also estimates revenue
+// exposure from the shortfall using the feeder's OWN measured average load
+// today (never a guessed customer count) times a configurable Band tariff.
+// This is the core "regulator can't operate without this" feature: it
+// turns raw telemetry into the exact compliance question NERC has to
+// answer for every Band A feeder, automatically, every day.
+// ---------------------------------------------------------------------------
+router.get('/sbt-scorecard', ah(async (req, res) => {
+  res.json(await computeSbtScorecard(req));
+}));
+
+async function computeSbtScorecard(req) {
+  const cfg = await getSettings();
+  const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
+  const minHours = { A: +cfg.sbt_hours_band_a, B: +cfg.sbt_hours_band_b, C: +cfg.sbt_hours_band_c,
+    D: +cfg.sbt_hours_band_d, E: +cfg.sbt_hours_band_e };
+  const tariff = { A: +cfg.sbt_tariff_band_a, B: +cfg.sbt_tariff_band_b, C: +cfg.sbt_tariff_band_c,
+    D: +cfg.sbt_tariff_band_d, E: +cfg.sbt_tariff_band_e };
+  const explanationDays = +cfg.sbt_explanation_days;
+  const downgradeDays = +cfg.sbt_downgrade_days;
+
+  const params = [date];
+  const discoCond = filterCond(req, params, 's');
+  const feedersRes = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.expected_interval_s, s.power_unit
+    FROM v_meter_status s
+    WHERE s.tariff_band IS NOT NULL ${discoCond}
+    ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
+  const feeders = feedersRes.rows;
+  if (feeders.length === 0) {
+    return { date, minHours, tariff, explanationDays, downgradeDays, discos: [], feeders: [] };
+  }
+  const meterIds = feeders.map((f) => f.meter_id);
+
+  // 14 trailing days of uptime, to count consecutive shortfall days ending
+  // at `date` without a separate query per feeder.
+  const daily = await pool.query(`
+    SELECT meter_id, time_bucket('1 day', bucket)::date AS day, sum(current_on_count) AS on_count
+    FROM agg_nerc_15min
+    WHERE meter_id = ANY($1) AND bucket >= $2::date - INTERVAL '13 days' AND bucket < $2::date + INTERVAL '1 day'
+    GROUP BY meter_id, day`, [meterIds, date]);
+  const byMeterDay = {};
+  daily.rows.forEach((r) => {
+    const k = r.meter_id;
+    (byMeterDay[k] = byMeterDay[k] || {})[r.day.toISOString().slice(0, 10)] = +r.on_count;
+  });
+
+  // Today's average measured load — the real, defensible basis for the
+  // revenue estimate (no assumed customer counts).
+  const power = await pool.query(`
+    SELECT meter_id, avg(avg_active_power) AS avg_power
+    FROM agg_15min
+    WHERE meter_id = ANY($1) AND bucket >= $2::date AND bucket < $2::date + interval '1 day'
+      AND received_count > 0
+    GROUP BY meter_id`, [meterIds, date]);
+  const avgPowerByMeter = {};
+  power.rows.forEach((r) => { avgPowerByMeter[r.meter_id] = +r.avg_power; });
+
+  const dayList = [];
+  for (let i = 0; i < 14; i++) {
+    const d = new Date(date + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - i);
+    dayList.push(d.toISOString().slice(0, 10));
+  }
+
+  const scored = feeders.map((f) => {
+    const band = f.tariff_band;
+    const need = minHours[band];
+    const hoursFor = (day) => {
+      const onCount = (byMeterDay[f.meter_id] || {})[day];
+      if (onCount == null) return null;
+      return Math.min(24, onCount * f.expected_interval_s / 3600);
+    };
+    const actualHours = +(hoursFor(date) || 0).toFixed(1);
+    const shortfallHours = need != null ? +Math.max(0, need - actualHours).toFixed(1) : null;
+    const met = need == null ? null : shortfallHours <= 0;
+
+    // Walk backward from `date` counting consecutive days below that
+    // Band's minimum; stops at the first compliant or data-less day.
+    let consecutiveShortfallDays = 0;
+    for (const day of dayList) {
+      const h = hoursFor(day);
+      if (h == null || need == null) break;
+      if (h < need) consecutiveShortfallDays++;
+      else break;
+    }
+
+    const avgPowerRaw = avgPowerByMeter[f.meter_id];
+    const avgPowerKW = avgPowerRaw != null
+      ? (f.power_unit === 'W' ? avgPowerRaw / 1000 : avgPowerRaw) : null;
+    const rate = tariff[band];
+    const revenueAtRiskNgn = (avgPowerKW != null && shortfallHours != null && rate != null)
+      ? +(avgPowerKW * shortfallHours * rate).toFixed(0) : null;
+
+    return {
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco, band,
+      minHours: need, actualHours, shortfallHours, met,
+      consecutiveShortfallDays,
+      explanationDue: met === false && consecutiveShortfallDays >= explanationDays,
+      downgradeRisk: met === false && consecutiveShortfallDays >= downgradeDays,
+      avgLoadKW: avgPowerKW != null ? +avgPowerKW.toFixed(2) : null,
+      revenueAtRiskNgn,
+    };
+  });
+
+  const byDisco = {};
+  scored.forEach((f) => { (byDisco[f.disco || 'Unassigned'] = byDisco[f.disco || 'Unassigned'] || []).push(f); });
+  const discos = Object.entries(byDisco).map(([disco, list]) => ({
+    disco,
+    feeders: list.length,
+    met: list.filter((f) => f.met).length,
+    notMet: list.filter((f) => f.met === false).length,
+    explanationDue: list.filter((f) => f.explanationDue).length,
+    downgradeRisk: list.filter((f) => f.downgradeRisk).length,
+    revenueAtRiskNgn: list.some((f) => f.revenueAtRiskNgn != null)
+      ? list.reduce((a, f) => a + (f.revenueAtRiskNgn || 0), 0) : null,
+  })).sort((a, b) => a.disco.localeCompare(b.disco));
+
+  return { date, minHours, tariff, explanationDays, downgradeDays, discos, feeders: scored };
+}
+
+// ---------------------------------------------------------------------------
 // Excel helpers
 // ---------------------------------------------------------------------------
 function sheetHeader(ws, title, rangeText, columns) {
@@ -369,6 +494,32 @@ router.get('/report/month-to-date', ah(async (req, res) => {
   });
   ws.columns.forEach((c, i) => { c.width = i < 6 ? 20 : 8; });
   await sendWb(res, wb, `Month To Date Report ${month}.xlsx`);
+}));
+
+// ---------------------------------------------------------------------------
+// GET /api/nerc/report/sbt-scorecard?date=&disco=&band=  (.xlsx)
+// Downloadable version of the SBT Compliance Scorecard above, in the same
+// regulator-report style as the other three exports.
+// ---------------------------------------------------------------------------
+router.get('/report/sbt-scorecard', ah(async (req, res) => {
+  const result = await computeSbtScorecard(req);
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Sheet1');
+  sheetHeader(ws, 'SBT Compliance Scorecard',
+    `${result.date}` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)')
+      + (req.query.band && req.query.band !== 'all' ? ` — Band ${req.query.band}` : ''),
+    ['S/N', 'Disco', 'Feeder Name', 'Band', 'Min Hours (NERC)', 'Actual Hours', 'Shortfall (Hrs)',
+     'Status', 'Consecutive Shortfall Days', 'Explanation Due', 'Downgrade Risk',
+     'Avg Load (kW)', 'Est. Revenue at Risk (NGN)']);
+  result.feeders.forEach((f, i) => {
+    ws.addRow([i + 1, f.disco || 'N/A', f.feeder, f.band, f.minHours, f.actualHours, f.shortfallHours,
+      f.met ? 'Met' : 'Not Met', f.consecutiveShortfallDays,
+      f.explanationDue ? 'YES' : '', f.downgradeRisk ? 'YES' : '',
+      f.avgLoadKW != null ? f.avgLoadKW : 'N/A',
+      f.revenueAtRiskNgn != null ? f.revenueAtRiskNgn : 'N/A']);
+  });
+  ws.columns.forEach((c, i) => { c.width = i < 3 ? 20 : 14; });
+  await sendWb(res, wb, `SBT Compliance Scorecard ${result.date}.xlsx`);
 }));
 
 module.exports = router;
