@@ -30,10 +30,16 @@ app.get('/api/health', async (_req, res) => {
     res.json({ ok: true, db: 'up', ingest: ingest.stats() });
   } catch (e) { res.status(500).json({ ok: false, db: e.message }); }
 });
+
+// SSL provider domain-validation file — intentionally public, no auth.
+// Place the file your CA gives you at:
+//   protogy_backend/.well-known/pki-validation/verify.txt
+// It will then be reachable at:
+//   https://protogyglobal.io/.well-known/pki-validation/verify.txt
+app.use('/.well-known', express.static(path.join(__dirname, '.well-known')));
+
 app.use('/api/auth', authRoutes);
 app.use('/api/hooks', hooks);
-// SSL provider domain-validation file — intentionally public, no auth.
-app.use('/.well-known', express.static(path.join(__dirname, '.well-known')));
 
 // protected API
 app.use('/api/ami', amiRoutes);

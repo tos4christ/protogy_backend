@@ -23,19 +23,20 @@ const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
 // ---------------------------------------------------------------------------
 router.post('/meters', requireAdmin, ah(async (req, res) => {
   const { meterId, feederName, location, intervalSeconds, user, metadata, controllerId, disco, latitude, longitude,
-    station, motherFeeder, category, state, voltageClass, nominalVoltage } = req.body;
+    station, motherFeeder, category, state, voltageClass, nominalVoltage, tariffBand } = req.body;
   if (!meterId || !feederName) {
     return res.status(400).json({ error: 'meterId and feederName are required' });
   }
   const { rows } = await pool.query(
-    'SELECT * FROM onboard_meter($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)',
+    'SELECT * FROM onboard_meter($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)',
     [meterId, feederName, location || null, intervalSeconds || 15, user || null,
      JSON.stringify(metadata || {}), controllerId || null, disco || null,
      latitude != null && latitude !== '' ? +latitude : null,
      longitude != null && longitude !== '' ? +longitude : null,
      station || null, motherFeeder || null, category || null, state || null,
      voltageClass || null,
-     nominalVoltage != null && nominalVoltage !== '' ? +nominalVoltage : null]
+     nominalVoltage != null && nominalVoltage !== '' ? +nominalVoltage : null,
+     tariffBand || null]
   );
   res.status(201).json(rows[0]);
 }));
@@ -327,6 +328,7 @@ router.get('/dashboard/overview', ah(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT s.meter_id, s.feeder_name, s.disco, s.connectivity, s.onboarding_status,
             s.last_reading_at, s.active_power, s.reactive_power, s.power_factor, s.frequency,
+            s.power_unit,
             COALESCE(d.dar_pct, 0)        AS dar_today,
             COALESCE(d.received_count, 0) AS received_today,
             COALESCE(d.buffered_count, 0) AS buffered_today
@@ -356,6 +358,7 @@ router.get('/meters/:id/series', ah(async (req, res) => {
   const { id } = req.params;
   const { date } = req.query;
   if (!isDate(date)) return res.status(400).json({ error: 'date=YYYY-MM-DD is required' });
+  const meter = await pool.query('SELECT power_unit FROM meters WHERE meter_id = $1', [id]);
   const { rows } = await pool.query(
     `SELECT bucket,
             round(avg_voltage_l1::numeric,1) AS v1, round(avg_voltage_l2::numeric,1) AS v2,
@@ -369,7 +372,7 @@ router.get('/meters/:id/series', ah(async (req, res) => {
      FROM agg_15min
      WHERE meter_id = $1 AND bucket >= $2::date AND bucket < $2::date + interval '1 day'
      ORDER BY bucket`, [id, date]);
-  res.json({ meterId: id, date, points: rows });
+  res.json({ meterId: id, date, powerUnit: meter.rows[0]?.power_unit || 'kW', points: rows });
 }));
 
 // ---------------------------------------------------------------------------

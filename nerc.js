@@ -103,11 +103,18 @@ router.get('/summary', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// GET /api/nerc/summary-table?date=YYYY-MM-DD  -> per-Disco executive table
+// GET /api/nerc/summary-table?date=YYYY-MM-DD&disco=  -> per-Disco executive table
+// When ?disco= is set, the table narrows to that single Disco row so it stays
+// in lockstep with the tiles above it and the feeder drill-down/reports below.
 // ---------------------------------------------------------------------------
 router.get('/summary-table', ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : null;
+  const params = [date];
+  let discoCond = '';
+  if (req.query.disco && req.query.disco !== 'all') {
+    params.push(req.query.disco); discoCond = ` AND s.disco = $${params.length}`;
+  }
   const { rows } = await pool.query(`
     WITH days AS (
       SELECT COALESCE($1::date, current_date) AS d1,
@@ -128,20 +135,27 @@ router.get('/summary-table', ah(async (req, res) => {
     LEFT JOIN LATERAL (
       SELECT avg(d.dar_pct) AS ma7 FROM v_dar_daily d
       WHERE d.meter_id = s.meter_id AND d.day >= days.d1 - 6 AND d.day <= days.d1) ma ON TRUE
-    WHERE s.disco IS NOT NULL
-    GROUP BY s.disco ORDER BY s.disco`, [date]);
-  res.json({ date: date || new Date().toISOString().slice(0, 10), rows });
+    WHERE s.disco IS NOT NULL ${discoCond}
+    GROUP BY s.disco ORDER BY s.disco`, params);
+  res.json({ date: date || new Date().toISOString().slice(0, 10), disco: req.query.disco || 'all', rows });
 }));
 
 // ---------------------------------------------------------------------------
-// GET /api/nerc/compliance?date=YYYY-MM-DD
+// GET /api/nerc/compliance?date=YYYY-MM-DD&disco=
 // Compliance level (current uptime / 24h) per FEEDER, plus per-Disco averages.
+// This backs the feeder drill-down, so it honours the same ?disco= as the
+// tiles and executive summary above it.
 // ---------------------------------------------------------------------------
 router.get('/compliance', ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
+  const params = [date];
+  let discoCond = '';
+  if (req.query.disco && req.query.disco !== 'all') {
+    params.push(req.query.disco); discoCond = ` AND s.disco = $${params.length}`;
+  }
   const { rows } = await pool.query(`
-    SELECT s.meter_id, s.feeder_name, s.disco,
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band,
       COALESCE(d.dar_pct, 0) AS dar_pct,
       LEAST(24, COALESCE(u.cur_on, 0) * s.expected_interval_s / 3600.0)  AS current_uptime_h,
       LEAST(24, COALESCE(u.volt_on, 0) * s.expected_interval_s / 3600.0) AS voltage_uptime_h
@@ -152,12 +166,14 @@ router.get('/compliance', ah(async (req, res) => {
       FROM agg_nerc_15min
       WHERE bucket >= $1::date AND bucket < $1::date + interval '1 day'
       GROUP BY meter_id) u ON u.meter_id = s.meter_id
-    ORDER BY s.disco NULLS LAST, s.feeder_name`, [date]);
+    WHERE 1=1 ${discoCond}
+    ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
 
   const feeders = rows.map((r) => {
     const compliance = +(+r.current_uptime_h / 24 * 100).toFixed(1);
     return {
       meterId: r.meter_id, feeder: r.feeder_name || r.meter_id, disco: r.disco,
+      tariffBand: r.tariff_band,
       darPct: +(+r.dar_pct).toFixed(1),
       currentUptimeH: +(+r.current_uptime_h).toFixed(1),
       voltageUptimeH: +(+r.voltage_uptime_h).toFixed(1),
@@ -212,13 +228,18 @@ const fmtDay = (d) => {
 };
 
 // ---------------------------------------------------------------------------
-// GET /api/nerc/report/daily-compliant?date=YYYY-MM-DD   (.xlsx)
+// GET /api/nerc/report/daily-compliant?date=YYYY-MM-DD&disco=   (.xlsx)
 // ---------------------------------------------------------------------------
 router.get('/report/daily-compliant', ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
+  const params = [date];
+  let discoCond = '';
+  if (req.query.disco && req.query.disco !== 'all') {
+    params.push(req.query.disco); discoCond = ` AND s.disco = $${params.length}`;
+  }
   const { rows } = await pool.query(`
-    SELECT s.disco, s.feeder_name, s.station, s.mother_feeder, s.expected_interval_s,
+    SELECT s.disco, s.feeder_name, s.station, s.mother_feeder, s.tariff_band, s.expected_interval_s,
       m.energy_unit,
       COALESCE(u.cur_on, 0) * s.expected_interval_s / 3600.0 AS current_uptime_h,
       COALESCE(u.volt_on, 0) * s.expected_interval_s / 3600.0 AS voltage_uptime_h,
@@ -233,12 +254,14 @@ router.get('/report/daily-compliant', ah(async (req, res) => {
       FROM agg_nerc_15min
       WHERE bucket >= $1::date AND bucket < $1::date + interval '1 day'
       GROUP BY meter_id) u ON u.meter_id = s.meter_id
-    ORDER BY s.disco NULLS LAST, s.feeder_name`, [date]);
+    WHERE 1=1 ${discoCond}
+    ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
 
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Sheet1');
-  sheetHeader(ws, 'Compliant Feeders Report', `${date} 00:00 - 23:59`,
-    ['S/N', 'Disco', 'Name', 'Station', 'Mother Feeder / Station', 'Current Uptime (Hrs)',
+  sheetHeader(ws, 'Compliant Feeders Report',
+    `${date} 00:00 - 23:59` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)'),
+    ['S/N', 'Disco', 'Name', 'Station', 'Mother Feeder / Station', 'Tariff Band', 'Current Uptime (Hrs)',
      'Voltage Uptime (Hrs)', 'DAR (%)', 'Power (MW)', 'Consumption (KWh)',
      'Compliance (%)', 'Compliance Status']);
   rows.forEach((r, i) => {
@@ -246,7 +269,7 @@ router.get('/report/daily-compliant', ah(async (req, res) => {
     const curH = Math.min(24, +r.current_uptime_h);
     const compliance = +(curH / 24 * 100).toFixed(1);
     ws.addRow([i + 1, r.disco || 'N/A', r.feeder_name || r.meter_id, r.station || 'N/A',
-      r.mother_feeder || 'N/A', +curH.toFixed(1),
+      r.mother_feeder || 'N/A', r.tariff_band || 'N/A', +curH.toFixed(1),
       +Math.min(24, +r.voltage_uptime_h).toFixed(1), +(+r.dar_pct).toFixed(1),
       +(kwh / 24 / 1000).toFixed(2), Math.round(kwh), compliance,
       compliance >= +cfg.compliance_met_pct ? 'Met' : 'Not Met']);
@@ -256,14 +279,19 @@ router.get('/report/daily-compliant', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// GET /api/nerc/report/data-acquisition?from=&to=   (.xlsx, per-day DAR)
+// GET /api/nerc/report/data-acquisition?from=&to=&disco=   (.xlsx, per-day DAR)
 // ---------------------------------------------------------------------------
 router.get('/report/data-acquisition', ah(async (req, res) => {
   const { from, to } = req.query;
   if (!isDate(from) || !isDate(to)) return res.status(400).json({ error: 'from and to (YYYY-MM-DD) required' });
+  const params = [];
+  let discoCond = '';
+  if (req.query.disco && req.query.disco !== 'all') {
+    params.push(req.query.disco); discoCond = ` WHERE disco = $${params.length}`;
+  }
   const meters = await pool.query(`
-    SELECT meter_id, disco, feeder_name, station, category, state, voltage_class
-    FROM v_meter_status ORDER BY disco NULLS LAST, feeder_name`);
+    SELECT meter_id, disco, feeder_name, station, category, state, voltage_class, tariff_band
+    FROM v_meter_status${discoCond} ORDER BY disco NULLS LAST, feeder_name`, params);
   const dar = await pool.query(`
     SELECT meter_id, day::date AS day, dar_pct FROM v_dar_daily
     WHERE day >= $1::date AND day <= $2::date`, [from, to]);
@@ -277,31 +305,37 @@ router.get('/report/data-acquisition', ah(async (req, res) => {
 
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Sheet1');
-  sheetHeader(ws, 'Data Acquisition Report', `${from} - ${to}`,
-    ['S/N', 'Disco', 'Feeder Name', 'Station', 'Feeder Category', 'State', 'Voltage Class',
+  sheetHeader(ws, 'Data Acquisition Report',
+    `${from} - ${to}` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)'),
+    ['S/N', 'Disco', 'Feeder Name', 'Station', 'Feeder Category', 'State', 'Voltage Class', 'Tariff Band',
      ...days.map(fmtDay)]);
   meters.rows.forEach((m, i) => {
     ws.addRow([i + 1, m.disco || 'N/A', m.feeder_name || m.meter_id, m.station || 'N/A',
-      m.category || 'N/A', m.state || 'N/A', m.voltage_class || 'N/A',
+      m.category || 'N/A', m.state || 'N/A', m.voltage_class || 'N/A', m.tariff_band || 'N/A',
       ...days.map((d) => {
         const v = (byMeter[m.meter_id] || {})[d.toISOString().slice(0, 10)];
         return v === undefined ? 0 : +v.toFixed(1);
       })]);
   });
-  ws.columns.forEach((c, i) => { c.width = i < 7 ? 20 : 9; });
+  ws.columns.forEach((c, i) => { c.width = i < 8 ? 20 : 9; });
   await sendWb(res, wb, `Data Acquisition Report ${from} to ${to}.xlsx`);
 }));
 
 // ---------------------------------------------------------------------------
-// GET /api/nerc/report/month-to-date?month=YYYY-MM  (.xlsx, per-day current-uptime hours)
+// GET /api/nerc/report/month-to-date?month=YYYY-MM&disco=  (.xlsx, per-day current-uptime hours)
 // ---------------------------------------------------------------------------
 router.get('/report/month-to-date', ah(async (req, res) => {
   const month = /^\d{4}-\d{2}$/.test(req.query.month || '')
     ? req.query.month : new Date().toISOString().slice(0, 7);
   const from = month + '-01';
+  const params = [];
+  let discoCond = '';
+  if (req.query.disco && req.query.disco !== 'all') {
+    params.push(req.query.disco); discoCond = ` WHERE s.disco = $${params.length}`;
+  }
   const meters = await pool.query(`
     SELECT s.meter_id, s.disco, s.feeder_name, s.category, s.mother_feeder, s.expected_interval_s
-    FROM v_meter_status s ORDER BY s.disco NULLS LAST, s.feeder_name`);
+    FROM v_meter_status s${discoCond} ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
   const up = await pool.query(`
     SELECT meter_id, time_bucket('1 day', bucket)::date AS day, sum(current_on_count) AS cur_on
     FROM agg_nerc_15min
@@ -319,7 +353,8 @@ router.get('/report/month-to-date', ah(async (req, res) => {
 
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Sheet1');
-  sheetHeader(ws, 'Month To Date Report', `${from} - ${last.toISOString().slice(0, 10)}`,
+  sheetHeader(ws, 'Month To Date Report',
+    `${from} - ${last.toISOString().slice(0, 10)}` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)'),
     ['S/N', 'Feeder Name', 'Category', 'Mother Feeder / Station', 'Disco', ...days.map(fmtDay)]);
   meters.rows.forEach((m, i) => {
     ws.addRow([i + 1, m.feeder_name || m.meter_id, m.category || 'N/A',
