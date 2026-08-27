@@ -258,15 +258,22 @@ async function computeSbtScorecard(req) {
   });
 
   // Today's average measured load — the real, defensible basis for the
-  // revenue estimate (no assumed customer counts).
+  // revenue estimate (no assumed customer counts). Also doubles as a data
+  // sanity check: if a feeder shows 0 readings here despite live current/
+  // power elsewhere, its meter_id likely doesn't match what the device is
+  // actually sending (e.g. a duplicate row from re-onboarding).
   const power = await pool.query(`
-    SELECT meter_id, avg(avg_active_power) AS avg_power
+    SELECT meter_id, avg(avg_active_power) AS avg_power, sum(received_count) AS readings_today
     FROM agg_15min
     WHERE meter_id = ANY($1) AND bucket >= $2::date AND bucket < $2::date + interval '1 day'
       AND received_count > 0
     GROUP BY meter_id`, [meterIds, date]);
   const avgPowerByMeter = {};
-  power.rows.forEach((r) => { avgPowerByMeter[r.meter_id] = +r.avg_power; });
+  const readingsTodayByMeter = {};
+  power.rows.forEach((r) => {
+    avgPowerByMeter[r.meter_id] = +r.avg_power;
+    readingsTodayByMeter[r.meter_id] = +r.readings_today;
+  });
 
   const dayList = [];
   for (let i = 0; i < 14; i++) {
@@ -311,6 +318,7 @@ async function computeSbtScorecard(req) {
       downgradeRisk: met === false && consecutiveShortfallDays >= downgradeDays,
       avgLoadKW: avgPowerKW != null ? +avgPowerKW.toFixed(2) : null,
       revenueAtRiskNgn,
+      readingsToday: readingsTodayByMeter[f.meter_id] || 0,
     };
   });
 
@@ -510,13 +518,14 @@ router.get('/report/sbt-scorecard', ah(async (req, res) => {
       + (req.query.band && req.query.band !== 'all' ? ` — Band ${req.query.band}` : ''),
     ['S/N', 'Disco', 'Feeder Name', 'Band', 'Min Hours (NERC)', 'Actual Hours', 'Shortfall (Hrs)',
      'Status', 'Consecutive Shortfall Days', 'Explanation Due', 'Downgrade Risk',
-     'Avg Load (kW)', 'Est. Revenue at Risk (NGN)']);
+     'Avg Load (kW)', 'Est. Revenue at Risk (NGN)', 'Readings Today']);
   result.feeders.forEach((f, i) => {
     ws.addRow([i + 1, f.disco || 'N/A', f.feeder, f.band, f.minHours, f.actualHours, f.shortfallHours,
       f.met ? 'Met' : 'Not Met', f.consecutiveShortfallDays,
       f.explanationDue ? 'YES' : '', f.downgradeRisk ? 'YES' : '',
       f.avgLoadKW != null ? f.avgLoadKW : 'N/A',
-      f.revenueAtRiskNgn != null ? f.revenueAtRiskNgn : 'N/A']);
+      f.revenueAtRiskNgn != null ? f.revenueAtRiskNgn : 'N/A',
+      f.readingsToday === 0 ? 'NO DATA — check meter_id' : f.readingsToday]);
   });
   ws.columns.forEach((c, i) => { c.width = i < 3 ? 20 : 14; });
   await sendWb(res, wb, `SBT Compliance Scorecard ${result.date}.xlsx`);
