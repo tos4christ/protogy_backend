@@ -15,6 +15,24 @@ const ah = (fn) => (req, res) => fn(req, res).catch((err) => {
 });
 const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
 
+// Builds "AND alias.disco = $n AND alias.tariff_band = $m" (or WHERE variant),
+// appending values to the given params array. Shared by every NERC endpoint
+// so DisCo + Band always filter together, the same way, everywhere.
+function filterCond(req, params, alias, keyword = 'AND') {
+  const col = (name) => (alias ? `${alias}.${name}` : name);
+  let cond = '';
+  if (req.query.disco && req.query.disco !== 'all') {
+    params.push(req.query.disco);
+    cond += ` ${keyword} ${col('disco')} = $${params.length}`;
+    keyword = 'AND';
+  }
+  if (req.query.band && req.query.band !== 'all') {
+    params.push(req.query.band);
+    cond += ` ${keyword} ${col('tariff_band')} = $${params.length}`;
+  }
+  return cond;
+}
+
 // active_power normalised to kW using each meter's declared power_unit
 const KW = "CASE WHEN s.power_unit = 'W' THEN s.active_power / 1000.0 ELSE s.active_power END";
 // energy normalised to kWh
@@ -26,10 +44,7 @@ const KWH = (col) => `CASE WHEN m.energy_unit = 'Wh' THEN (${col}) / 1000.0 ELSE
 router.get('/summary', ah(async (req, res) => {
   const cfg = await getSettings();
   const params = [];
-  let discoCond = '';
-  if (req.query.disco && req.query.disco !== 'all') {
-    params.push(req.query.disco); discoCond = ` AND s.disco = $${params.length}`;
-  }
+  const discoCond = filterCond(req, params, 's');
 
   // Live tile counts from latest readings
   const live = await pool.query(`
@@ -111,10 +126,7 @@ router.get('/summary-table', ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : null;
   const params = [date];
-  let discoCond = '';
-  if (req.query.disco && req.query.disco !== 'all') {
-    params.push(req.query.disco); discoCond = ` AND s.disco = $${params.length}`;
-  }
+  const discoCond = filterCond(req, params, 's');
   const { rows } = await pool.query(`
     WITH days AS (
       SELECT COALESCE($1::date, current_date) AS d1,
@@ -137,7 +149,7 @@ router.get('/summary-table', ah(async (req, res) => {
       WHERE d.meter_id = s.meter_id AND d.day >= days.d1 - 6 AND d.day <= days.d1) ma ON TRUE
     WHERE s.disco IS NOT NULL ${discoCond}
     GROUP BY s.disco ORDER BY s.disco`, params);
-  res.json({ date: date || new Date().toISOString().slice(0, 10), disco: req.query.disco || 'all', rows });
+  res.json({ date: date || new Date().toISOString().slice(0, 10), disco: req.query.disco || 'all', band: req.query.band || 'all', rows });
 }));
 
 // ---------------------------------------------------------------------------
@@ -150,10 +162,7 @@ router.get('/compliance', ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
   const params = [date];
-  let discoCond = '';
-  if (req.query.disco && req.query.disco !== 'all') {
-    params.push(req.query.disco); discoCond = ` AND s.disco = $${params.length}`;
-  }
+  const discoCond = filterCond(req, params, 's');
   const { rows } = await pool.query(`
     SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band,
       COALESCE(d.dar_pct, 0) AS dar_pct,
@@ -234,10 +243,7 @@ router.get('/report/daily-compliant', ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
   const params = [date];
-  let discoCond = '';
-  if (req.query.disco && req.query.disco !== 'all') {
-    params.push(req.query.disco); discoCond = ` AND s.disco = $${params.length}`;
-  }
+  const discoCond = filterCond(req, params, 's');
   const { rows } = await pool.query(`
     SELECT s.disco, s.feeder_name, s.station, s.mother_feeder, s.tariff_band, s.expected_interval_s,
       m.energy_unit,
@@ -260,7 +266,8 @@ router.get('/report/daily-compliant', ah(async (req, res) => {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Sheet1');
   sheetHeader(ws, 'Compliant Feeders Report',
-    `${date} 00:00 - 23:59` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)'),
+    `${date} 00:00 - 23:59` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)')
+      + (req.query.band && req.query.band !== 'all' ? ` — Band ${req.query.band}` : ''),
     ['S/N', 'Disco', 'Name', 'Station', 'Mother Feeder / Station', 'Tariff Band', 'Current Uptime (Hrs)',
      'Voltage Uptime (Hrs)', 'DAR (%)', 'Power (MW)', 'Consumption (KWh)',
      'Compliance (%)', 'Compliance Status']);
@@ -285,10 +292,7 @@ router.get('/report/data-acquisition', ah(async (req, res) => {
   const { from, to } = req.query;
   if (!isDate(from) || !isDate(to)) return res.status(400).json({ error: 'from and to (YYYY-MM-DD) required' });
   const params = [];
-  let discoCond = '';
-  if (req.query.disco && req.query.disco !== 'all') {
-    params.push(req.query.disco); discoCond = ` WHERE disco = $${params.length}`;
-  }
+  const discoCond = filterCond(req, params, '', 'WHERE');
   const meters = await pool.query(`
     SELECT meter_id, disco, feeder_name, station, category, state, voltage_class, tariff_band
     FROM v_meter_status${discoCond} ORDER BY disco NULLS LAST, feeder_name`, params);
@@ -306,7 +310,8 @@ router.get('/report/data-acquisition', ah(async (req, res) => {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Sheet1');
   sheetHeader(ws, 'Data Acquisition Report',
-    `${from} - ${to}` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)'),
+    `${from} - ${to}` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)')
+      + (req.query.band && req.query.band !== 'all' ? ` — Band ${req.query.band}` : ''),
     ['S/N', 'Disco', 'Feeder Name', 'Station', 'Feeder Category', 'State', 'Voltage Class', 'Tariff Band',
      ...days.map(fmtDay)]);
   meters.rows.forEach((m, i) => {
@@ -329,12 +334,9 @@ router.get('/report/month-to-date', ah(async (req, res) => {
     ? req.query.month : new Date().toISOString().slice(0, 7);
   const from = month + '-01';
   const params = [];
-  let discoCond = '';
-  if (req.query.disco && req.query.disco !== 'all') {
-    params.push(req.query.disco); discoCond = ` WHERE s.disco = $${params.length}`;
-  }
+  const discoCond = filterCond(req, params, 's', 'WHERE');
   const meters = await pool.query(`
-    SELECT s.meter_id, s.disco, s.feeder_name, s.category, s.mother_feeder, s.expected_interval_s
+    SELECT s.meter_id, s.disco, s.feeder_name, s.category, s.mother_feeder, s.expected_interval_s, s.tariff_band
     FROM v_meter_status s${discoCond} ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
   const up = await pool.query(`
     SELECT meter_id, time_bucket('1 day', bucket)::date AS day, sum(current_on_count) AS cur_on
@@ -354,17 +356,18 @@ router.get('/report/month-to-date', ah(async (req, res) => {
   const wb = new ExcelJS.Workbook();
   const ws = wb.addWorksheet('Sheet1');
   sheetHeader(ws, 'Month To Date Report',
-    `${from} - ${last.toISOString().slice(0, 10)}` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)'),
-    ['S/N', 'Feeder Name', 'Category', 'Mother Feeder / Station', 'Disco', ...days.map(fmtDay)]);
+    `${from} - ${last.toISOString().slice(0, 10)}` + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)')
+      + (req.query.band && req.query.band !== 'all' ? ` — Band ${req.query.band}` : ''),
+    ['S/N', 'Feeder Name', 'Category', 'Mother Feeder / Station', 'Disco', 'Tariff Band', ...days.map(fmtDay)]);
   meters.rows.forEach((m, i) => {
     ws.addRow([i + 1, m.feeder_name || m.meter_id, m.category || 'N/A',
-      m.mother_feeder || 'N/A', m.disco || 'N/A',
+      m.mother_feeder || 'N/A', m.disco || 'N/A', m.tariff_band || 'N/A',
       ...days.map((d) => {
         const c = (byMeter[m.meter_id] || {})[d.toISOString().slice(0, 10)] || 0;
         return Math.min(24, Math.round(c * m.expected_interval_s / 3600));
       })]);
   });
-  ws.columns.forEach((c, i) => { c.width = i < 5 ? 20 : 8; });
+  ws.columns.forEach((c, i) => { c.width = i < 6 ? 20 : 8; });
   await sendWb(res, wb, `Month To Date Report ${month}.xlsx`);
 }));
 
