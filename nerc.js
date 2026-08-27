@@ -231,7 +231,7 @@ async function computeSbtScorecard(req) {
   const explanationDays = +cfg.sbt_explanation_days;
   const downgradeDays = +cfg.sbt_downgrade_days;
 
-  const params = [date];
+  const params = [];
   const discoCond = filterCond(req, params, 's');
   const feedersRes = await pool.query(`
     SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.expected_interval_s, s.power_unit
