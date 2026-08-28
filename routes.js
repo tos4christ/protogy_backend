@@ -200,9 +200,10 @@ router.get('/meters/:id/dar', ah(async (req, res) => {
   else {
     const n = Math.min(366, Math.max(1, +(days || 7)));
     const r = await pool.query(
-      `SELECT (current_date - ($1 - 1) * interval '1 day')::date AS f, current_date AS t`, [n]);
-    fromD = r.rows[0].f.toISOString ? r.rows[0].f.toISOString().slice(0, 10) : r.rows[0].f;
-    toD = r.rows[0].t.toISOString ? r.rows[0].t.toISOString().slice(0, 10) : r.rows[0].t;
+      `SELECT to_char(current_date - ($1 - 1) * interval '1 day', 'YYYY-MM-DD') AS f,
+              to_char(current_date, 'YYYY-MM-DD') AS t`, [n]);
+    fromD = r.rows[0].f;
+    toD = r.rows[0].t;
   }
   const { rows } = await pool.query(
     `SELECT day::date AS day, received_count, expected_count, dar_pct, buffered_count, avg_latency_s

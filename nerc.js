@@ -251,7 +251,7 @@ async function computeSbtScorecard(req) {
   // "current flowing" and made feeders look permanently non-compliant
   // even with real, nonzero current on screen.
   const daily = await pool.query(`
-    SELECT meter_id, time_bucket('1 day', bucket)::date AS day,
+    SELECT meter_id, to_char(time_bucket('1 day', bucket), 'YYYY-MM-DD') AS day,
       count(*) FILTER (WHERE GREATEST(avg_current_l1, avg_current_l2, avg_current_l3) > $3) AS on_buckets
     FROM agg_15min
     WHERE meter_id = ANY($1) AND bucket >= $2::date - INTERVAL '13 days' AND bucket < $2::date + INTERVAL '1 day'
@@ -259,9 +259,15 @@ async function computeSbtScorecard(req) {
   const byMeterDay = {};
   daily.rows.forEach((r) => {
     const k = r.meter_id;
+    // r.day is now a plain 'YYYY-MM-DD' string straight from Postgres
+    // (to_char), never a JS Date object — node-postgres parses SQL DATE
+    // columns using the SERVER PROCESS's local timezone, not UTC, so
+    // calling .toISOString() on one silently shifts the day backward
+    // whenever the server isn't running in UTC. This was causing every
+    // lookup below to miss its own data.
     // Each bucket is 15 minutes = 0.25h, regardless of the meter's own
     // sampling interval — simpler and consistent across the fleet.
-    (byMeterDay[k] = byMeterDay[k] || {})[r.day.toISOString().slice(0, 10)] = +r.on_buckets * 0.25;
+    (byMeterDay[k] = byMeterDay[k] || {})[r.day] = +r.on_buckets * 0.25;
   });
 
   // Today's average measured load — the real, defensible basis for the
@@ -444,11 +450,11 @@ router.get('/report/data-acquisition', ah(async (req, res) => {
     SELECT meter_id, disco, feeder_name, station, category, state, voltage_class, tariff_band
     FROM v_meter_status${discoCond} ORDER BY disco NULLS LAST, feeder_name`, params);
   const dar = await pool.query(`
-    SELECT meter_id, day::date AS day, dar_pct FROM v_dar_daily
+    SELECT meter_id, to_char(day, 'YYYY-MM-DD') AS day, dar_pct FROM v_dar_daily
     WHERE day >= $1::date AND day <= $2::date`, [from, to]);
   const byMeter = {};
   dar.rows.forEach((r) => {
-    (byMeter[r.meter_id] = byMeter[r.meter_id] || {})[r.day.toISOString().slice(0, 10)] = +r.dar_pct;
+    (byMeter[r.meter_id] = byMeter[r.meter_id] || {})[r.day] = +r.dar_pct;
   });
   const days = [];
   for (let d = new Date(from + 'T00:00:00Z'); d <= new Date(to + 'T00:00:00Z');
@@ -486,13 +492,13 @@ router.get('/report/month-to-date', ah(async (req, res) => {
     SELECT s.meter_id, s.disco, s.feeder_name, s.category, s.mother_feeder, s.expected_interval_s, s.tariff_band
     FROM v_meter_status s${discoCond} ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
   const up = await pool.query(`
-    SELECT meter_id, time_bucket('1 day', bucket)::date AS day, sum(current_on_count) AS cur_on
+    SELECT meter_id, to_char(time_bucket('1 day', bucket), 'YYYY-MM-DD') AS day, sum(current_on_count) AS cur_on
     FROM agg_nerc_15min
     WHERE bucket >= $1::date AND bucket < ($1::date + interval '1 month')
     GROUP BY meter_id, 2`, [from]);
   const byMeter = {};
   up.rows.forEach((r) => {
-    (byMeter[r.meter_id] = byMeter[r.meter_id] || {})[r.day.toISOString().slice(0, 10)] = +r.cur_on;
+    (byMeter[r.meter_id] = byMeter[r.meter_id] || {})[r.day] = +r.cur_on;
   });
   const last = new Date(Math.min(
     new Date(new Date(from + 'T00:00:00Z').setUTCMonth(new Date(from + 'T00:00:00Z').getUTCMonth() + 1) - 86400000),
