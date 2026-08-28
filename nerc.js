@@ -344,19 +344,152 @@ async function computeSbtScorecard(req) {
 
   const byDisco = {};
   scored.forEach((f) => { (byDisco[f.disco || 'Unassigned'] = byDisco[f.disco || 'Unassigned'] || []).push(f); });
-  const discos = Object.entries(byDisco).map(([disco, list]) => ({
-    disco,
-    feeders: list.length,
-    met: list.filter((f) => f.met).length,
-    notMet: list.filter((f) => f.met === false).length,
-    explanationDue: list.filter((f) => f.explanationDue).length,
-    downgradeRisk: list.filter((f) => f.downgradeRisk).length,
-    revenueAtRiskNgn: list.some((f) => f.revenueAtRiskNgn != null)
-      ? list.reduce((a, f) => a + (f.revenueAtRiskNgn || 0), 0) : null,
-  })).sort((a, b) => a.disco.localeCompare(b.disco));
+  const discos = Object.entries(byDisco).map(([disco, list]) => {
+    const withNeed = list.filter((f) => f.minHours != null);
+    const avgCompliancePct = withNeed.length
+      ? +(withNeed.reduce((a, f) => a + Math.min(100, (f.actualHours / f.minHours) * 100), 0)
+          / withNeed.length).toFixed(1)
+      : null;
+    return {
+      disco,
+      feeders: list.length,
+      met: list.filter((f) => f.met).length,
+      notMet: list.filter((f) => f.met === false).length,
+      explanationDue: list.filter((f) => f.explanationDue).length,
+      downgradeRisk: list.filter((f) => f.downgradeRisk).length,
+      avgCompliancePct,
+      revenueAtRiskNgn: list.some((f) => f.revenueAtRiskNgn != null)
+        ? list.reduce((a, f) => a + (f.revenueAtRiskNgn || 0), 0) : null,
+    };
+  }).sort((a, b) => a.disco.localeCompare(b.disco));
 
   return { date, minHours, tariff, explanationDays, downgradeDays, discos, feeders: scored };
 }
+
+// ---------------------------------------------------------------------------
+// GET /api/nerc/league-table?date=&compareDays=
+// Public-facing DisCo ranking on SBT compliance, modeled on Ofgem's public
+// supplier scorecards: ranked (not just listed), with a trend arrow vs a
+// prior period. This is built for external visibility — a naming-and-
+// ranking table is the kind of thing NERC can point to publicly, which
+// makes the platform politically useful, not just operationally useful.
+// Ranking uses a completed day by default (yesterday), like the SBT
+// Scorecard, since "today" is always partial.
+// ---------------------------------------------------------------------------
+router.get('/league-table', ah(async (req, res) => {
+  const yesterday = () => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); };
+  const date = isDate(req.query.date) ? req.query.date : yesterday();
+  const compareDays = Math.max(1, +req.query.compareDays || 7);
+  const compareDate = (() => {
+    const d = new Date(date + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - compareDays);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  const [current, previous] = await Promise.all([
+    computeSbtScorecard({ query: { date } }),
+    computeSbtScorecard({ query: { date: compareDate } }),
+  ]);
+
+  const metPct = (d) => (d.met + d.notMet > 0 ? +(d.met / (d.met + d.notMet) * 100).toFixed(1) : null);
+  const prevByDisco = {};
+  previous.discos.forEach((d) => { prevByDisco[d.disco] = metPct(d); });
+
+  const ranked = current.discos
+    .map((d) => {
+      const pct = metPct(d);
+      const prevPct = prevByDisco[d.disco];
+      const trend = (pct != null && prevPct != null) ? +(pct - prevPct).toFixed(1) : null;
+      return { disco: d.disco, feeders: d.feeders, metPct: pct, avgCompliancePct: d.avgCompliancePct,
+        explanationDue: d.explanationDue, downgradeRisk: d.downgradeRisk, trend };
+    })
+    .sort((a, b) => (b.metPct ?? -1) - (a.metPct ?? -1) || (b.avgCompliancePct ?? -1) - (a.avgCompliancePct ?? -1))
+    .map((d, i) => ({ rank: i + 1, ...d }));
+
+  res.json({ date, compareDate, discos: ranked });
+}));
+
+// ---------------------------------------------------------------------------
+// GET /api/nerc/dar-anomalies?days=&disco=&band=
+// Flags statistically suspicious DAR reporting rather than genuine
+// compliance: values sitting at exactly 100% for an implausibly long
+// stretch, sudden day-over-day jumps too large for real telemetry, or a
+// value that repeats identically for many days (a stuck/cached figure).
+// This is the "auditor" feature — Protogy verifying data integrity, not
+// just relaying self-reported numbers.
+// ---------------------------------------------------------------------------
+router.get('/dar-anomalies', ah(async (req, res) => {
+  const cfg = await getSettings();
+  const days = Math.min(60, Math.max(7, +req.query.days || +cfg.anomaly_window_days));
+  const perfectThreshold = +cfg.anomaly_perfect_days;
+  const jumpThreshold = +cfg.anomaly_jump_pp;
+  const flatlineThreshold = +cfg.anomaly_flatline_days;
+
+  const params = [];
+  const discoCond = filterCond(req, params, 's');
+  const feedersRes = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band
+    FROM v_meter_status s WHERE 1=1 ${discoCond}
+    ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
+  const feeders = feedersRes.rows;
+  if (feeders.length === 0) return res.json({ days, thresholds: { perfectThreshold, jumpThreshold, flatlineThreshold }, discos: [], feeders: [] });
+  const meterIds = feeders.map((f) => f.meter_id);
+
+  const darRes = await pool.query(`
+    SELECT meter_id, to_char(day, 'YYYY-MM-DD') AS day, dar_pct
+    FROM v_dar_daily
+    WHERE meter_id = ANY($1) AND day >= current_date - ($2 || ' days')::interval AND day < current_date
+    ORDER BY meter_id, day`, [meterIds, days]);
+  const byMeter = {};
+  darRes.rows.forEach((r) => { (byMeter[r.meter_id] = byMeter[r.meter_id] || []).push(+r.dar_pct); });
+
+  const scored = feeders.map((f) => {
+    const values = byMeter[f.meter_id] || [];
+    // Trailing run of exact 100.00% readings, most recent day backward.
+    let consecutivePerfectDays = 0;
+    for (let i = values.length - 1; i >= 0; i--) {
+      if (values[i] === 100) consecutivePerfectDays++; else break;
+    }
+    // Largest single day-over-day swing in the window.
+    let maxJumpPp = 0;
+    for (let i = 1; i < values.length; i++) {
+      maxJumpPp = Math.max(maxJumpPp, Math.abs(values[i] - values[i - 1]));
+    }
+    maxJumpPp = +maxJumpPp.toFixed(1);
+    // Longest run of an identical value repeated back-to-back (any value —
+    // a real sensor's DAR moves at least slightly day to day).
+    let flatlineRunDays = 0, run = 1;
+    for (let i = 1; i < values.length; i++) {
+      if (values[i] === values[i - 1]) { run++; flatlineRunDays = Math.max(flatlineRunDays, run); }
+      else run = 1;
+    }
+    if (values.length === 1) flatlineRunDays = 1;
+
+    const flags = {
+      suspiciouslyPerfect: consecutivePerfectDays >= perfectThreshold,
+      suspiciousJump: maxJumpPp >= jumpThreshold,
+      flatline: flatlineRunDays >= flatlineThreshold,
+    };
+    const anomalyCount = Object.values(flags).filter(Boolean).length;
+
+    return {
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco, band: f.tariff_band,
+      daysObserved: values.length, consecutivePerfectDays, maxJumpPp, flatlineRunDays,
+      flags, anomalyCount,
+    };
+  }).sort((a, b) => b.anomalyCount - a.anomalyCount || b.consecutivePerfectDays - a.consecutivePerfectDays);
+
+  const byDisco = {};
+  scored.forEach((f) => { (byDisco[f.disco || 'Unassigned'] = byDisco[f.disco || 'Unassigned'] || []).push(f); });
+  const discos = Object.entries(byDisco).map(([disco, list]) => ({
+    disco, feeders: list.length,
+    flagged: list.filter((f) => f.anomalyCount > 0).length,
+    suspiciouslyPerfect: list.filter((f) => f.flags.suspiciouslyPerfect).length,
+    suspiciousJump: list.filter((f) => f.flags.suspiciousJump).length,
+    flatline: list.filter((f) => f.flags.flatline).length,
+  })).sort((a, b) => a.disco.localeCompare(b.disco));
+
+  res.json({ days, thresholds: { perfectThreshold, jumpThreshold, flatlineThreshold }, discos, feeders: scored });
+}));
 
 // ---------------------------------------------------------------------------
 // Excel helpers

@@ -21,6 +21,13 @@ const DEFAULTS = {
   // consecutive non-performing days, and the feeder is auto-downgraded
   // after this many. Applied fleet-wide here as an early-warning signal.
   sbt_explanation_days: 2, sbt_downgrade_days: 7,
+  // DAR Anomaly Detection thresholds — flags statistically suspicious
+  // reporting rather than genuine compliance. Real telemetry over
+  // cellular/radio links essentially never sits at exactly 100% for many
+  // days straight, jumps by huge margins overnight, or repeats an
+  // identical value for a long stretch — these patterns suggest a
+  // reporting/integrity issue worth investigating, not a real result.
+  anomaly_window_days: 21, anomaly_perfect_days: 10, anomaly_jump_pp: 50, anomaly_flatline_days: 7,
 };
 
 async function getSettings() {
