@@ -28,6 +28,12 @@ const DEFAULTS = {
   // identical value for a long stretch — these patterns suggest a
   // reporting/integrity issue worth investigating, not a real result.
   anomaly_window_days: 21, anomaly_perfect_days: 10, anomaly_jump_pp: 50, anomaly_flatline_days: 7,
+  // Power Quality Analytics — a poor power factor below this is flagged as
+  // inefficient (typical utility penalty threshold is 0.85-0.90); a phase
+  // current imbalance above this % is flagged as an unbalanced load, both
+  // of which are early indicators of equipment stress or wiring faults
+  // distinct from simple online/offline connectivity.
+  pf_poor_threshold: 0.85, current_imbalance_pct_threshold: 10,
 };
 
 async function getSettings() {

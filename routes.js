@@ -4,6 +4,7 @@ const Cursor = require('pg-cursor');
 const pool = require('./db');
 
 const { requireAdmin } = require('./auth');
+const { getSettings } = require('./settings');
 const router = express.Router();
 const V_THR = +(process.env.VOLTAGE_PRESENT_THRESHOLD || 50);
 const I_THR = +(process.env.CURRENT_PRESENT_THRESHOLD || 0.5);
@@ -413,6 +414,84 @@ router.get('/dashboard/overview', ah(async (req, res) => {
     bandSummary,
     page: Math.min(page, totalPages), limit: limitRaw === 'all' ? 'all' : limit, totalPages, total,
     feeders: pageRows,
+  });
+}));
+
+// ---------------------------------------------------------------------------
+// POWER QUALITY ANALYTICS: fleet-wide power factor distribution, worst-PF
+// feeders, and phase current imbalance — real-time, computed from each
+// feeder's latest live reading (not a daily rollup). Two distinct power-
+// quality problems, neither visible from a simple online/offline view:
+//   - Poor power factor: reactive load inefficiency, a real cost driver for
+//     DisCos and a classic utility penalty metric.
+//   - Phase current imbalance: one phase carrying meaningfully more load
+//     than the others, an early indicator of wiring faults or an unevenly
+//     distributed single-phase load — invisible unless you compare phases
+//     directly, which no other screen in the app currently does.
+// GET /api/dashboard/power-quality?disco=&band=
+// ---------------------------------------------------------------------------
+router.get('/dashboard/power-quality', ah(async (req, res) => {
+  const cfg = await getSettings();
+  const pfThreshold = +cfg.pf_poor_threshold;
+  const imbalanceThreshold = +cfg.current_imbalance_pct_threshold;
+
+  const params = [];
+  const conds = ["s.connectivity = 'online'"];
+  if (req.query.disco) { params.push(req.query.disco); conds.push(`s.disco = $${params.length}`); }
+  if (req.query.band) { params.push(req.query.band); conds.push(`s.tariff_band = $${params.length}`); }
+  const { rows } = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band,
+           s.power_factor, s.current_l1, s.current_l2, s.current_l3
+    FROM v_meter_status s
+    WHERE ${conds.join(' AND ')}`, params);
+
+  // Power factor distribution — bucketed for a fleet-wide histogram.
+  const pfBuckets = [
+    { range: '< 0.70 (poor)', min: -Infinity, max: 0.70, count: 0 },
+    { range: '0.70 – 0.85', min: 0.70, max: 0.85, count: 0 },
+    { range: '0.85 – 0.95', min: 0.85, max: 0.95, count: 0 },
+    { range: '≥ 0.95 (good)', min: 0.95, max: Infinity, count: 0 },
+  ];
+  const withPf = rows.filter((r) => r.power_factor != null);
+  withPf.forEach((r) => {
+    const pf = Math.abs(+r.power_factor);
+    const b = pfBuckets.find((x) => pf >= x.min && pf < x.max) || pfBuckets[pfBuckets.length - 1];
+    b.count++;
+  });
+  const avgPf = withPf.length
+    ? +(withPf.reduce((a, r) => a + Math.abs(+r.power_factor), 0) / withPf.length).toFixed(3) : null;
+
+  const poorPf = withPf
+    .filter((r) => Math.abs(+r.power_factor) < pfThreshold)
+    .map((r) => ({ meterId: r.meter_id, feeder: r.feeder_name || r.meter_id, disco: r.disco,
+      band: r.tariff_band, powerFactor: +Math.abs(+r.power_factor).toFixed(3) }))
+    .sort((a, b) => a.powerFactor - b.powerFactor)
+    .slice(0, 25);
+
+  // Phase current imbalance — how far the most-loaded phase deviates from
+  // the average of all three, as a percentage of that average.
+  const withCurrent = rows.filter((r) => r.current_l1 != null && r.current_l2 != null && r.current_l3 != null);
+  const imbalanceList = withCurrent.map((r) => {
+    const i1 = +r.current_l1, i2 = +r.current_l2, i3 = +r.current_l3;
+    const avg = (i1 + i2 + i3) / 3;
+    const maxDev = Math.max(Math.abs(i1 - avg), Math.abs(i2 - avg), Math.abs(i3 - avg));
+    const pct = avg > 0.1 ? +(maxDev / avg * 100).toFixed(1) : 0;
+    return { meterId: r.meter_id, feeder: r.feeder_name || r.meter_id, disco: r.disco, band: r.tariff_band,
+      current_l1: i1, current_l2: i2, current_l3: i3, imbalancePct: pct };
+  });
+  const avgImbalancePct = imbalanceList.length
+    ? +(imbalanceList.reduce((a, r) => a + r.imbalancePct, 0) / imbalanceList.length).toFixed(1) : null;
+  const worstImbalance = imbalanceList
+    .filter((r) => r.imbalancePct >= imbalanceThreshold)
+    .sort((a, b) => b.imbalancePct - a.imbalancePct)
+    .slice(0, 25);
+
+  res.json({
+    generatedAt: new Date().toISOString(),
+    feedersAnalyzed: rows.length,
+    pfThreshold, imbalanceThreshold,
+    pf: { avgPf, buckets: pfBuckets.map(({ range, count }) => ({ range, count })), poor: poorPf },
+    imbalance: { avgImbalancePct, worst: worstImbalance },
   });
 }));
 
