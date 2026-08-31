@@ -91,15 +91,15 @@ function normalizePayload(raw) {
     const d = raw.data;
     return {
       timestamp: d.timestamp || d.time || raw.time || new Date().toISOString(),
-      voltage_l1: num(d.V_L12), voltage_l2: num(d.V_L23), voltage_l3: num(d.V_L31),
+      voltage_l1: num(d.V_L12/1000), voltage_l2: num(d.V_L23/1000), voltage_l3: num(d.V_L31/1000),
       current_l1: num(d.A_L1), current_l2: num(d.A_L2), current_l3: num(d.A_L3),
       frequency: num(d.Frequency_Avg), power_factor: num(d.Power_Factor_Avg),
-      active_power: num(d.Active_Power_Inst),
-      reactive_power: num(d.Reactive_Power_Inst),
-      apparent_power: num(d.Apparent_Power_Inst),
-      active_energy: num(d.Active_energy_Tot),
-      reactive_energy: num(d.Reactive_energy_Tot),
-      apparent_energy: num(d.Apparent_Energy_Tot),
+      active_power: num(d.Active_Power_Inst/1000),
+      reactive_power: num(d.Reactive_Power_Inst/1000),
+      apparent_power: num(d.Apparent_Power_Inst/1000),
+      active_energy: num(d.Active_energy_Tot/1000),
+      reactive_energy: num(d.Reactive_energy_Tot/1000),
+      apparent_energy: num(d.Apparent_Energy_Tot/1000),
       status: num(d.Status), exti_trigger: bool01(d.EXTI_Trigger),
       payver: num(d.Payver) ?? 0,
     };
