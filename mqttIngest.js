@@ -53,6 +53,7 @@ function normalizePayload(raw) {
   // Mapping: line-to-line voltages V12/V23/V31 -> voltage_l1/l2/l3;
   // Current1..3 -> currents; per-phase kW SUMMED -> active_power;
   // per-phase PF AVERAGED -> power_factor. Missing fields stay null.
+  // ELASTEL TYPE
   if (raw && typeof raw.data === 'object' && raw.data !== null
       && ('Current1' in raw.data || 'Active Power kW1' in raw.data
           || 'Voltage V23' in raw.data || 'True Power Factor PH1' in raw.data)) {
@@ -75,17 +76,17 @@ function normalizePayload(raw) {
       frequency: num(d.Frequency) ?? num(d.FREQUENCY) ?? num(d['Frequency Hz']),
       power_factor: pf.length ? +(pf.reduce((a, b) => a + b, 0) / pf.length).toFixed(3) : null,
       active_power: kw.length ? +kw.reduce((a, b) => a + b, 0).toFixed(2) : num(d['Active Power kW']),
-      reactive_power: num(d['Reactive Power kVAr']) ?? null,
-      apparent_power: num(d['Apparent Power kVA']) ?? null,
-      active_energy: num(d['Active Energy kWh']) ?? num(d['Energy kWh']) ?? null,
-      reactive_energy: num(d['Reactive Energy kVArh']) ?? null,
-      apparent_energy: num(d['Apparent Energy kVAh']) ?? null,
+      reactive_power: num(d['Reactive Power VAR1']) ?? null,
+      apparent_power: num(d['Apparent Power KVA1']) ?? null,
+      active_energy: num(d['Active Energy']) ?? num(d['Energy kWh']) ?? null,
+      reactive_energy: num(d['Reactive Energy']) ?? null,
+      apparent_energy: num(d['Apparent Energy']) ?? null,
       status: num(d.Status) ?? null, exti_trigger: 0,
       payver: num(d.Payver) ?? 0,
     };
   }
 
-  // Format B: nested "data" object
+  // Format B: nested "data" object ESUMEI TYPE
   if (raw && typeof raw.data === 'object' && raw.data !== null) {
     const d = raw.data;
     return {
