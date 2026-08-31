@@ -22,18 +22,36 @@ const COLS = [
 
 
 // ---------------------------------------------------------------------------
-// Payload normalization - supports BOTH vendor formats:
+// Payload normalization - supports multiple vendor formats:
 // A) Flat format:   { timestamp, voltage_l1, current_l1, active_power, ... }
-// B) Nested format: { time, DevEUI, data: { V_L12, A_L1, Active_Power_Inst,
-//                     Frequency_Avg, ... }, provider_source, ... }
+// B) Nested format (ESUMEI-type controllers): { time, DevEUI, data: { V_L12,
+//    A_L1, Active_Power_Inst, Frequency_Avg, ... }, provider_source, ... }
 //    (LoRaWAN-style; line-to-line voltages V_L12/V_L23/V_L31 map to the
 //     voltage_l1/l2/l3 columns; EXTI_Trigger arrives as "TRUE"/"FALSE".)
+//    This controller transmits voltage in VOLTS, and power/energy in their
+//    base SI units (W, Wh) rather than the kV/kW/kWh Protogy stores
+//    everywhere else — so voltage, power, and energy are all divided by
+//    1000 here at ingestion. This keeps every meter's stored values on the
+//    same kV/kW/kWh scale regardless of vendor, so no other part of the
+//    app (reports, Feeder Status, Dashboard) needs to know which format a
+//    given meter used — meters.power_unit/energy_unit already default to
+//    'kW'/'kWh' platform-wide, matching this conversion with no further
+//    per-meter configuration needed.
 // Returns a flat object with canonical keys, or null if unrecognizable.
 // ---------------------------------------------------------------------------
 function num(v) {
   if (v === null || v === undefined || v === '') return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
+}
+// Like num(), but scales by 1/1000 (V->kV, W->kW, Wh->kWh) while preserving
+// null for a missing/invalid reading. Using `num(x) / 1000` directly is a
+// trap: null / 1000 evaluates to 0 in JavaScript, which would silently turn
+// "no reading" into a fake zero everywhere a "voltage/power present"
+// threshold or a Feeder Status "—" placeholder depends on the distinction.
+function numDiv1000(v) {
+  const n = num(v);
+  return n === null ? null : n / 1000;
 }
 function bool01(v) {
   if (typeof v === 'string') return v.trim().toUpperCase() === 'TRUE' ? 1 : 0;
@@ -53,7 +71,6 @@ function normalizePayload(raw) {
   // Mapping: line-to-line voltages V12/V23/V31 -> voltage_l1/l2/l3;
   // Current1..3 -> currents; per-phase kW SUMMED -> active_power;
   // per-phase PF AVERAGED -> power_factor. Missing fields stay null.
-  // ELASTEL TYPE
   if (raw && typeof raw.data === 'object' && raw.data !== null
       && ('Current1' in raw.data || 'Active Power kW1' in raw.data
           || 'Voltage V23' in raw.data || 'True Power Factor PH1' in raw.data)) {
@@ -86,20 +103,21 @@ function normalizePayload(raw) {
     };
   }
 
-  // Format B: nested "data" object ESUMEI TYPE
+  // Format B: nested "data" object (ESUMEI-type controller — raw units;
+  // see the comment above on why voltage/power/energy are divided by 1000).
   if (raw && typeof raw.data === 'object' && raw.data !== null) {
     const d = raw.data;
     return {
       timestamp: d.timestamp || d.time || raw.time || new Date().toISOString(),
-      voltage_l1: num(d.V_L12/1000), voltage_l2: num(d.V_L23/1000), voltage_l3: num(d.V_L31/1000),
+      voltage_l1: numDiv1000(d.V_L12), voltage_l2: numDiv1000(d.V_L23), voltage_l3: numDiv1000(d.V_L31),
       current_l1: num(d.A_L1), current_l2: num(d.A_L2), current_l3: num(d.A_L3),
       frequency: num(d.Frequency_Avg), power_factor: num(d.Power_Factor_Avg),
-      active_power: num(d.Active_Power_Inst/1000),
-      reactive_power: num(d.Reactive_Power_Inst/1000),
-      apparent_power: num(d.Apparent_Power_Inst/1000),
-      active_energy: num(d.Active_energy_Tot/1000),
-      reactive_energy: num(d.Reactive_energy_Tot/1000),
-      apparent_energy: num(d.Apparent_Energy_Tot/1000),
+      active_power: numDiv1000(d.Active_Power_Inst),
+      reactive_power: numDiv1000(d.Reactive_Power_Inst),
+      apparent_power: numDiv1000(d.Apparent_Power_Inst),
+      active_energy: numDiv1000(d.Active_energy_Tot),
+      reactive_energy: numDiv1000(d.Reactive_energy_Tot),
+      apparent_energy: numDiv1000(d.Apparent_Energy_Tot),
       status: num(d.Status), exti_trigger: bool01(d.EXTI_Trigger),
       payver: num(d.Payver) ?? 0,
     };

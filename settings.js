@@ -6,7 +6,12 @@ const { requireAuth, requireAdmin } = require('./auth');
 const router = express.Router();
 const DEFAULTS = {
   dar_compliance_pct: 95, compliance_met_pct: 95, voltage_tolerance_pct: 10,
-  current_flow_threshold: 0.5, voltage_present_threshold: 50,
+  current_flow_threshold: 0.5,
+  // Originally 50 (intended as 50 raw Volts) — but voltage_l1/l2/l3 are
+  // stored in kV across every payload format (see mqttIngest.js), so the
+  // threshold must be expressed in kV too: 0.05 kV = 50V, preserving the
+  // original real-world meaning correctly in the unit actually stored.
+  voltage_present_threshold: 0.05,
   // Service-Based Tariff (SBT) minimum daily supply hours per NERC Band
   // (NERC Order, effective 3 Apr 2024): A=20h, B=16h, C=12h, D=8h, E=4h.
   sbt_hours_band_a: 20, sbt_hours_band_b: 16, sbt_hours_band_c: 12,
