@@ -63,13 +63,15 @@ router.get('/executive-summary', ah(async (req, res) => {
     SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class,
            s.connectivity, s.power_unit, s.energy_unit
     FROM v_meter_status s
-    WHERE 1=1 ${cond}`, params);
+    WHERE 1=1 ${cond}
+    ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
   const feeders = feedersRes.rows;
 
   if (feeders.length === 0) {
     return res.json({
       date, feeders: 0, online: 0, offline: 0, avgDarPct: null, availabilityPct: null,
       totalEnergyKwh: 0, avgLoadKW: null, peakLoadKW: null, discos: [],
+      page: 1, limit: 50, totalPages: 1, total: 0, feederRows: [],
     });
   }
   const meterIds = feeders.map((f) => f.meter_id);
@@ -98,6 +100,7 @@ router.get('/executive-summary', ah(async (req, res) => {
   let online = 0, offline = 0, sumActual = 0, sumRequired = 0, sumEnergy = 0;
   let sumAvgPower = 0, powerCount = 0, peakLoadKW = 0, sumDar = 0, darCount = 0;
   const byDisco = {};
+  const feederRows = [];
 
   feeders.forEach((f) => {
     const isOnline = f.connectivity === 'online';
@@ -117,11 +120,23 @@ router.get('/executive-summary', ah(async (req, res) => {
     if (a && a.peak_power != null) peakPowerKW = f.power_unit === 'W' ? +a.peak_power / 1000 : +a.peak_power;
 
     const dar = darByMeter[f.meter_id];
+    const feederAvailabilityPct = need != null ? Math.min(100, +(actualHours / need * 100).toFixed(1)) : null;
     if (dar != null) { sumDar += dar; darCount++; }
     if (need != null) { sumActual += actualHours; sumRequired += need; }
     sumEnergy += energyKwh;
     if (avgPowerKW != null) { sumAvgPower += avgPowerKW; powerCount++; }
     if (peakPowerKW != null && peakPowerKW > peakLoadKW) peakLoadKW = peakPowerKW;
+
+    feederRows.push({
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco,
+      band: f.tariff_band, state: f.state, voltageClass: f.voltage_class,
+      connectivity: f.connectivity,
+      darPct: dar != null ? +dar.toFixed(1) : null,
+      availabilityPct: feederAvailabilityPct,
+      energyKwh: +energyKwh.toFixed(1),
+      avgLoadKW: avgPowerKW != null ? +avgPowerKW.toFixed(1) : null,
+      peakLoadKW: peakPowerKW != null ? +peakPowerKW.toFixed(1) : null,
+    });
 
     const dk = f.disco || 'Unassigned';
     const d = byDisco[dk] || (byDisco[dk] = {
@@ -148,6 +163,18 @@ router.get('/executive-summary', ah(async (req, res) => {
     peakLoadKW: +d.peakPower.toFixed(1),
   })).sort((a, b) => a.disco.localeCompare(b.disco));
 
+  // Feeder-level table is paginated — the fleet/Disco aggregates above are
+  // already computed over the FULL filtered set, so pagination here only
+  // affects how many individual feeder rows render at once, keeping the
+  // page fast for fleets with hundreds or thousands of feeders.
+  const total = feederRows.length;
+  const limitRaw = (req.query.limit || '').toLowerCase();
+  const limit = limitRaw === 'all' ? total : Math.min(500, Math.max(1, +req.query.limit || 50));
+  const page = Math.max(1, +req.query.page || 1);
+  const totalPages = Math.max(1, Math.ceil(total / (limit || 1)));
+  const start = (Math.min(page, totalPages) - 1) * limit;
+  const pageRows = limitRaw === 'all' ? feederRows : feederRows.slice(start, start + limit);
+
   res.json({
     date, feeders: feeders.length, online, offline,
     avgDarPct: darCount ? +(sumDar / darCount).toFixed(1) : null,
@@ -155,6 +182,8 @@ router.get('/executive-summary', ah(async (req, res) => {
     totalEnergyKwh: +sumEnergy.toFixed(1),
     avgLoadKW: powerCount ? +(sumAvgPower / powerCount).toFixed(1) : null,
     peakLoadKW: +peakLoadKW.toFixed(1),
+    page: Math.min(page, totalPages), limit: limitRaw === 'all' ? 'all' : limit, totalPages, total,
+    feederRows: pageRows,
     discos,
   });
 }));
