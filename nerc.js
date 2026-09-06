@@ -1196,4 +1196,176 @@ router.get('/report/performance-categorization', ah(async (req, res) => {
   await sendWb(res, wb, `Performance Categorization ${result.month}.xlsx`);
 }));
 
+// ---------------------------------------------------------------------------
+// DIAGNOSTICS PAGE — "what went wrong, and where."
+// Consolidates every data-integrity and equipment-health signal the
+// platform collects into one place, rather than leaving them scattered:
+//   - Connectivity: offline feeders, how long, never-reported since onboard
+//   - Data quality: zero readings today, current sensor not reporting
+//     (voltage present but current never populates — a wiring/device
+//     issue, same pattern the SBT Scorecard flags)
+//   - Data gaps: empty 15-min buckets today (generalises Feeder Explorer's
+//     per-feeder Gaps view to the whole fleet at once)
+//   - Communication quality: high average latency or heavy local
+//     buffering — data agg_15min has always collected but no screen has
+//     ever surfaced
+//   - Missing configuration: feeders lacking Band/Disco/State/Voltage
+//     Level/coordinates, which silently breaks Band-based and map features
+//   - Possible duplicate meters: same feeder name, different Meter ID —
+//     the exact real-world bug pattern found and fixed earlier this project
+// DAR Anomalies and Power Quality issues are NOT recomputed here — the
+// frontend calls their existing endpoints directly and renders them as
+// sections on this same page, so there is one page to look at without
+// duplicating that logic.
+// GET /api/nerc/diagnostics?date=&disco=&band=&state=&voltageClass=&search=&page=&limit=
+// ---------------------------------------------------------------------------
+router.get('/diagnostics', ah(async (req, res) => {
+  const cfg = await getSettings();
+  const date = isDate(req.query.date) ? req.query.date : yesterday();
+  const latencyWarnS = +cfg.diag_latency_warn_s;
+  const bufferedWarnCount = +cfg.diag_buffered_warn_count;
+  const gapBucketsWarn = +cfg.diag_gap_buckets_warn;
+
+  const params = [];
+  const cond = filterCond(req, params, 's');
+  let searchCond = '';
+  if (req.query.search && req.query.search.trim()) {
+    params.push(`%${req.query.search.trim()}%`);
+    searchCond = ` AND (s.feeder_name ILIKE $${params.length} OR s.meter_id ILIKE $${params.length})`;
+  }
+  const feedersRes = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class,
+           s.connectivity, s.last_reading_at, s.power_factor, s.current_l1, s.current_l2, s.current_l3
+    FROM v_meter_status s WHERE 1=1 ${cond} ${searchCond}
+    ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
+  const feeders = feedersRes.rows;
+
+  const pfPoorThreshold = +cfg.pf_poor_threshold;
+  const imbalanceThreshold = +cfg.current_imbalance_pct_threshold;
+
+  const emptyResult = {
+    date, total: 0, counts: {}, feederRows: [], missingConfig: [], duplicateGroups: [],
+    page: 1, limit: 50, totalPages: 1,
+  };
+  if (feeders.length === 0) return res.json(emptyResult);
+  const meterIds = feeders.map((f) => f.meter_id);
+
+  const agg = await pool.query(`
+    SELECT meter_id,
+      sum(received_count) AS readings_today,
+      count(*) FILTER (WHERE received_count = 0) AS empty_buckets,
+      bool_or(avg_current_l1 IS NOT NULL OR avg_current_l2 IS NOT NULL OR avg_current_l3 IS NOT NULL) AS has_current,
+      avg(avg_latency_s) AS avg_latency_s, max(max_latency_s) AS max_latency_s,
+      sum(buffered_count) AS buffered_count
+    FROM agg_15min
+    WHERE meter_id = ANY($1) AND bucket >= $2::date AND bucket < $2::date + interval '1 day'
+    GROUP BY meter_id`, [meterIds, date]);
+  const byMeter = {};
+  agg.rows.forEach((r) => { byMeter[r.meter_id] = r; });
+
+  const counts = {
+    offline: 0, neverReported: 0, noData: 0, noCurrentSensor: 0, dataGaps: 0,
+    highLatency: 0, heavyBuffering: 0, poorPowerFactor: 0, phaseImbalance: 0,
+  };
+
+  const scored = feeders.map((f) => {
+    const a = byMeter[f.meter_id];
+    const readingsToday = a ? +a.readings_today : 0;
+    const emptyBuckets = a ? +a.empty_buckets : 96;
+    const neverReported = f.last_reading_at == null;
+    const noData = !neverReported && readingsToday === 0;
+    const noCurrentSensor = readingsToday > 0 && a && !a.has_current;
+    const dataGaps = emptyBuckets >= gapBucketsWarn;
+    const avgLatencyS = a && a.avg_latency_s != null ? +a.avg_latency_s : null;
+    const maxLatencyS = a && a.max_latency_s != null ? +a.max_latency_s : null;
+    const bufferedCount = a ? +a.buffered_count || 0 : 0;
+    const highLatency = avgLatencyS != null && avgLatencyS > latencyWarnS;
+    const heavyBuffering = bufferedCount > bufferedWarnCount;
+
+    let powerFactor = null, imbalancePct = null, poorPowerFactor = false, phaseImbalance = false;
+    if (f.connectivity === 'online') {
+      if (f.power_factor != null) {
+        powerFactor = +Math.abs(+f.power_factor).toFixed(3);
+        poorPowerFactor = powerFactor < pfPoorThreshold;
+      }
+      if (f.current_l1 != null && f.current_l2 != null && f.current_l3 != null) {
+        const i1 = +f.current_l1, i2 = +f.current_l2, i3 = +f.current_l3;
+        const avgI = (i1 + i2 + i3) / 3;
+        const maxDev = Math.max(Math.abs(i1 - avgI), Math.abs(i2 - avgI), Math.abs(i3 - avgI));
+        imbalancePct = avgI > 0.1 ? +(maxDev / avgI * 100).toFixed(1) : 0;
+        phaseImbalance = imbalancePct >= imbalanceThreshold;
+      }
+    }
+
+    const isOffline = f.connectivity !== 'online';
+    if (isOffline) counts.offline++;
+    if (neverReported) counts.neverReported++;
+    if (noData) counts.noData++;
+    if (noCurrentSensor) counts.noCurrentSensor++;
+    if (dataGaps) counts.dataGaps++;
+    if (highLatency) counts.highLatency++;
+    if (heavyBuffering) counts.heavyBuffering++;
+    if (poorPowerFactor) counts.poorPowerFactor++;
+    if (phaseImbalance) counts.phaseImbalance++;
+
+    const issueCount = [isOffline, neverReported, noData, noCurrentSensor, dataGaps,
+      highLatency, heavyBuffering, poorPowerFactor, phaseImbalance].filter(Boolean).length;
+
+    return {
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco, band: f.tariff_band,
+      state: f.state, voltageClass: f.voltage_class, connectivity: f.connectivity,
+      lastReadingAt: f.last_reading_at, readingsToday, emptyBuckets,
+      neverReported, noData, noCurrentSensor, dataGaps,
+      avgLatencyS: avgLatencyS != null ? +avgLatencyS.toFixed(1) : null,
+      maxLatencyS: maxLatencyS != null ? +maxLatencyS.toFixed(1) : null,
+      bufferedCount, highLatency, heavyBuffering,
+      powerFactor, imbalancePct, poorPowerFactor, phaseImbalance,
+      issueCount,
+    };
+  });
+
+  // Worst (most flags) first, so attention goes where it's needed without
+  // scanning the whole fleet manually.
+  const sorted = scored.slice().sort((a, b) => b.issueCount - a.issueCount);
+  const total = sorted.length;
+  const limitRaw = (req.query.limit || '').toLowerCase();
+  const limit = limitRaw === 'all' ? total : Math.min(500, Math.max(1, +req.query.limit || 50));
+  const page = Math.max(1, +req.query.page || 1);
+  const totalPages = Math.max(1, Math.ceil(total / (limit || 1)));
+  const start = (Math.min(page, totalPages) - 1) * limit;
+  const pageRows = limitRaw === 'all' ? sorted : sorted.slice(start, start + limit);
+
+  // Missing configuration — feeders lacking metadata that silently breaks
+  // Band-based features (SBT/League/Categorization) or the map.
+  const missingConfig = feeders
+    .filter((f) => !f.tariff_band || !f.disco || !f.state || !f.voltage_class)
+    .map((f) => ({
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id,
+      missingBand: !f.tariff_band, missingDisco: !f.disco,
+      missingState: !f.state, missingVoltageClass: !f.voltage_class,
+    }))
+    .slice(0, 200);
+
+  // Possible duplicate meters — same feeder name, different Meter ID. This
+  // is the exact real-world pattern that caused a feeder to silently show
+  // zero data earlier in this project (a re-onboard with a slightly
+  // different Meter ID creates a second, empty record instead of updating
+  // the original).
+  const byName = {};
+  feeders.forEach((f) => {
+    if (!f.feeder_name) return;
+    (byName[f.feeder_name] = byName[f.feeder_name] || []).push(f.meter_id);
+  });
+  const duplicateGroups = Object.entries(byName)
+    .filter(([, ids]) => ids.length > 1)
+    .map(([feederName, ids]) => ({ feederName, meterIds: ids }));
+
+  res.json({
+    date, total, counts,
+    page: Math.min(page, totalPages), limit: limitRaw === 'all' ? 'all' : limit, totalPages,
+    feederRows: pageRows, missingConfig, duplicateGroups,
+    thresholds: { latencyWarnS, bufferedWarnCount, gapBucketsWarn, pfPoorThreshold, imbalanceThreshold },
+  });
+}));
+
 module.exports = router;

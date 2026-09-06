@@ -46,6 +46,11 @@ const DEFAULTS = {
   // Compensation and Downgrade. Confirm these against NERC's actual
   // published cutoffs — these are sensible defaults, not official figures.
   categorization_compliant_pct: 95, categorization_downgrade_pct: 70,
+  // Diagnostics page thresholds — flags a feeder's communication quality
+  // as poor without necessarily being fully offline (high latency or
+  // heavy local buffering both indicate an intermittent connection).
+  diag_latency_warn_s: 300, diag_buffered_warn_count: 20,
+  diag_gap_buckets_warn: 8, // empty 15-min buckets in a day (out of 96) before flagging gaps
 };
 
 async function getSettings() {
