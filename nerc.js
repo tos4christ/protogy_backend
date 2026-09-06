@@ -408,6 +408,124 @@ router.get('/reporting-detail', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// PERFORMANCE CATEGORIZATION (NERC requirement — "another report").
+// Every feeder classified into one of three monthly tiers based on
+// Availability = hours supplied ÷ hours required for its Band, measured
+// over the 1st-21st of the given month specifically (not the full month):
+//   >= compliant threshold        -> Compliant
+//   >= downgrade threshold        -> Marked for Compensation
+//   below downgrade threshold     -> Marked for Compensation and Downgrade
+// GET /api/nerc/performance-categorization?month=YYYY-MM&disco=&band=&state=&voltageClass=&page=&limit=
+// ---------------------------------------------------------------------------
+async function computePerformanceCategorization(req) {
+  const cfg = await getSettings();
+  const minHours = { A: +cfg.sbt_hours_band_a, B: +cfg.sbt_hours_band_b, C: +cfg.sbt_hours_band_c,
+    D: +cfg.sbt_hours_band_d, E: +cfg.sbt_hours_band_e };
+  const compliantPct = +cfg.categorization_compliant_pct;
+  const downgradePct = +cfg.categorization_downgrade_pct;
+
+  // Default month: the most recently CLOSED 1st-21st window — if we're
+  // still within or before day 21 of the current month, that window is
+  // incomplete, so fall back to last month's.
+  const month = /^\d{4}-\d{2}$/.test(req.query.month || '') ? req.query.month : (() => {
+    const d = new Date();
+    if (d.getUTCDate() <= 21) d.setUTCMonth(d.getUTCMonth() - 1);
+    return d.toISOString().slice(0, 7);
+  })();
+  const monthStart = `${month}-01`;
+  const monthEnd = `${month}-21`;
+
+  const params = [];
+  const cond = filterCond(req, params, 's');
+  let searchCond = '';
+  if (req.query.search && req.query.search.trim()) {
+    params.push(`%${req.query.search.trim()}%`);
+    searchCond = ` AND (s.feeder_name ILIKE $${params.length} OR s.meter_id ILIKE $${params.length})`;
+  }
+  const feedersRes = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class
+    FROM v_meter_status s
+    WHERE s.tariff_band IS NOT NULL ${cond} ${searchCond}
+    ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
+  const feeders = feedersRes.rows;
+
+  const emptyResult = {
+    month, monthStart, monthEnd, compliantPct, downgradePct,
+    counts: { Compliant: 0, 'Marked for Compensation': 0, 'Marked for Compensation and Downgrade': 0 },
+    discos: [], page: 1, limit: 50, totalPages: 1, total: 0, feederRows: [],
+  };
+  if (feeders.length === 0) return emptyResult;
+  const meterIds = feeders.map((f) => f.meter_id);
+
+  // Hours supplied across the 21-day window — same current-flow-threshold
+  // logic used by the SBT Scorecard and Executive Summary, just summed
+  // over more days instead of one.
+  const hoursRes = await pool.query(`
+    SELECT meter_id,
+      count(*) FILTER (WHERE GREATEST(avg_current_l1, avg_current_l2, avg_current_l3) > $1) AS on_buckets
+    FROM agg_15min
+    WHERE meter_id = ANY($2) AND bucket >= $3::date AND bucket < $4::date + interval '1 day'
+    GROUP BY meter_id`, [+cfg.current_flow_threshold, meterIds, monthStart, monthEnd]);
+  const hoursByMeter = {};
+  hoursRes.rows.forEach((r) => { hoursByMeter[r.meter_id] = +r.on_buckets * 0.25; });
+
+  const scored = feeders.map((f) => {
+    const need = minHours[f.tariff_band];
+    const requiredHours = need != null ? need * 21 : null;
+    const actualHours = Math.min(requiredHours || 21 * 24, hoursByMeter[f.meter_id] || 0);
+    const availabilityPct = requiredHours ? Math.min(100, +(actualHours / requiredHours * 100).toFixed(1)) : null;
+    let category = null;
+    if (availabilityPct != null) {
+      category = availabilityPct >= compliantPct ? 'Compliant'
+        : availabilityPct >= downgradePct ? 'Marked for Compensation'
+        : 'Marked for Compensation and Downgrade';
+    }
+    return {
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco, band: f.tariff_band,
+      state: f.state, voltageClass: f.voltage_class,
+      requiredHours, actualHours: +actualHours.toFixed(1), availabilityPct, category,
+    };
+  });
+
+  const counts = { Compliant: 0, 'Marked for Compensation': 0, 'Marked for Compensation and Downgrade': 0 };
+  scored.forEach((f) => { if (f.category) counts[f.category]++; });
+
+  const byDisco = {};
+  scored.forEach((f) => {
+    const dk = f.disco || 'Unassigned';
+    const d = byDisco[dk] || (byDisco[dk] = {
+      disco: dk, feeders: 0, compliant: 0, compensation: 0, compensationDowngrade: 0,
+    });
+    d.feeders++;
+    if (f.category === 'Compliant') d.compliant++;
+    else if (f.category === 'Marked for Compensation') d.compensation++;
+    else if (f.category === 'Marked for Compensation and Downgrade') d.compensationDowngrade++;
+  });
+  const discos = Object.values(byDisco).sort((a, b) => a.disco.localeCompare(b.disco));
+
+  // Worst-availability-first, so the feeders needing attention surface
+  // immediately rather than being buried alphabetically.
+  const sorted = scored.slice().sort((a, b) => (a.availabilityPct ?? 101) - (b.availabilityPct ?? 101));
+  const total = sorted.length;
+  const limitRaw = (req.query.limit || '').toLowerCase();
+  const limit = limitRaw === 'all' ? total : Math.min(500, Math.max(1, +req.query.limit || 50));
+  const page = Math.max(1, +req.query.page || 1);
+  const totalPages = Math.max(1, Math.ceil(total / (limit || 1)));
+  const start = (Math.min(page, totalPages) - 1) * limit;
+  const pageRows = limitRaw === 'all' ? sorted : sorted.slice(start, start + limit);
+
+  return {
+    month, monthStart, monthEnd, compliantPct, downgradePct, counts, discos,
+    page: Math.min(page, totalPages), limit: limitRaw === 'all' ? 'all' : limit, totalPages, total,
+    feederRows: pageRows,
+  };
+}
+
+router.get('/performance-categorization', ah(async (req, res) => {
+  res.json(await computePerformanceCategorization(req));
+}));
+
+// ---------------------------------------------------------------------------
 // GET /api/nerc/summary?disco=   -> all 12 dashboard tiles (live + daily)
 // ---------------------------------------------------------------------------
 router.get('/summary', ah(async (req, res) => {
@@ -1052,6 +1170,30 @@ router.get('/report/sbt-scorecard', ah(async (req, res) => {
   });
   ws.columns.forEach((c, i) => { c.width = i < 3 ? 20 : 14; });
   await sendWb(res, wb, `SBT Compliance Scorecard ${result.date}.xlsx`);
+}));
+
+// ---------------------------------------------------------------------------
+// GET /api/nerc/report/performance-categorization?month=&disco=&band=&state=&voltageClass=
+// Downloadable version of the Performance Categorization report.
+// ---------------------------------------------------------------------------
+router.get('/report/performance-categorization', ah(async (req, res) => {
+  const reqAll = { query: { ...req.query, limit: 'all' } };
+  const result = await computePerformanceCategorization(reqAll);
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Sheet1');
+  sheetHeader(ws, 'Performance Categorization',
+    `${result.monthStart} to ${result.monthEnd}`
+      + (req.query.disco && req.query.disco !== 'all' ? ` (${req.query.disco})` : ' (All DisCos)')
+      + (req.query.band && req.query.band !== 'all' ? ` — Band ${req.query.band}` : ''),
+    ['S/N', 'Disco', 'Feeder Name', 'Band', 'State', 'Voltage Level',
+     'Required Hours (1st-21st)', 'Actual Hours', 'Availability (%)', 'Category']);
+  result.feederRows.forEach((f, i) => {
+    ws.addRow([i + 1, f.disco || 'N/A', f.feeder, f.band, f.state || 'N/A', f.voltageClass || 'N/A',
+      f.requiredHours != null ? f.requiredHours : 'N/A', f.actualHours,
+      f.availabilityPct != null ? f.availabilityPct : 'N/A', f.category || 'N/A']);
+  });
+  ws.columns.forEach((c, i) => { c.width = i < 3 ? 22 : 16; });
+  await sendWb(res, wb, `Performance Categorization ${result.month}.xlsx`);
 }));
 
 module.exports = router;

@@ -39,6 +39,13 @@ const DEFAULTS = {
   // of which are early indicators of equipment stress or wiring faults
   // distinct from simple online/offline connectivity.
   pf_poor_threshold: 0.85, current_imbalance_pct_threshold: 10,
+  // Performance Categorization (NERC monthly report, 1st-21st window):
+  // Availability = hours supplied ÷ hours required for the feeder's Band.
+  // >= compliant_pct -> Compliant; >= downgrade_pct (but below compliant)
+  // -> Marked for Compensation; below downgrade_pct -> Marked for
+  // Compensation and Downgrade. Confirm these against NERC's actual
+  // published cutoffs — these are sensible defaults, not official figures.
+  categorization_compliant_pct: 95, categorization_downgrade_pct: 70,
 };
 
 async function getSettings() {
