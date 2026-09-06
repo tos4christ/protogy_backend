@@ -212,9 +212,17 @@ router.get('/dar-history', ah(async (req, res) => {
 
   const params = [];
   const cond = filterCond(req, params, 's');
+  // Free-text search on feeder name / meter ID — with a fleet that can grow
+  // into the thousands, categorical filters alone aren't enough for a
+  // regulator hunting one specific substation.
+  let searchCond = '';
+  if (req.query.search && req.query.search.trim()) {
+    params.push(`%${req.query.search.trim()}%`);
+    searchCond = ` AND (s.feeder_name ILIKE $${params.length} OR s.meter_id ILIKE $${params.length})`;
+  }
   const feedersRes = await pool.query(`
     SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class
-    FROM v_meter_status s WHERE 1=1 ${cond}
+    FROM v_meter_status s WHERE 1=1 ${cond} ${searchCond}
     ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
   const feeders = feedersRes.rows;
 
