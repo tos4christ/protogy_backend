@@ -327,24 +327,36 @@ router.get('/reporting-detail', ah(async (req, res) => {
     const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - 6); return d.toISOString().slice(0, 10);
   })();
   if (new Date(from) > new Date(to)) return res.status(400).json({ error: '"from" must be on or before "to"' });
+  // Cap the range — this now queries raw readings (not a pre-aggregated
+  // table) across the full span for one meter, so an unbounded range could
+  // scan a very large number of rows.
+  const MAX_DAYS = 92;
+  if (Math.round((new Date(to) - new Date(from)) / 86400000) + 1 > MAX_DAYS) {
+    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - (MAX_DAYS - 1));
+    from = d.toISOString().slice(0, 10);
+  }
 
   const feederRes = await pool.query(`SELECT * FROM v_meter_status WHERE meter_id = $1`, [meterId]);
   if (feederRes.rows.length === 0) return res.status(404).json({ error: 'Feeder not found' });
   const f = feederRes.rows[0];
 
-  // Intraday series (the "to" date) — live aggregation on raw readings,
-  // 15-minute buckets, for this one meter only.
+  // Electrical series now span the FULL From-To range, like Load Flow and
+  // Energy already did — not just the "to" day. Bucket size adapts to the
+  // span so a wide range doesn't produce thousands of unreadable points:
+  // fine-grained for a few days, coarser as the range grows.
+  const spanDays = Math.round((new Date(to) - new Date(from)) / 86400000) + 1;
+  const bucketSize = spanDays <= 3 ? '15 minutes' : spanDays <= 14 ? '1 hour' : '1 day';
   const intraday = await pool.query(`
-    SELECT time_bucket('15 minutes', meter_ts) AS bucket,
+    SELECT time_bucket('${bucketSize}', meter_ts) AS bucket,
       avg(voltage_l1) v1, avg(voltage_l2) v2, avg(voltage_l3) v3,
       avg(current_l1) i1, avg(current_l2) i2, avg(current_l3) i3,
       avg(frequency) freq, avg(power_factor) pf,
       avg(active_power) p, avg(reactive_power) q, avg(apparent_power) s
     FROM readings
-    WHERE meter_id = $1 AND meter_ts >= $2::date AND meter_ts < $2::date + interval '1 day'
-    GROUP BY bucket ORDER BY bucket`, [meterId, to]);
+    WHERE meter_id = $1 AND meter_ts >= $2::date AND meter_ts < $3::date + interval '1 day'
+    GROUP BY bucket ORDER BY bucket`, [meterId, from, to]);
 
-  // Daily Load Flow + Energy trend across the From-To range.
+  // Daily Load Flow + Energy trend across the same From-To range.
   const daily = await pool.query(`
     SELECT to_char(bucket, 'YYYY-MM-DD') AS day,
       avg(avg_active_power) avg_power, max(avg_active_power) peak_power,
@@ -383,7 +395,7 @@ router.get('/reporting-detail', ah(async (req, res) => {
       apparentPower: f.apparent_power != null ? +f.apparent_power * kwFactor : null,
       powerUnit: 'kW', lastReadingAt: f.last_reading_at,
     },
-    from, to,
+    from, to, intradayBucket: bucketSize,
     intraday: intraday.rows.map((r) => ({
       t: r.bucket, v1: r.v1, v2: r.v2, v3: r.v3, i1: r.i1, i2: r.i2, i3: r.i3,
       freq: r.freq, pf: r.pf,
