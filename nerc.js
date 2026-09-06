@@ -284,7 +284,120 @@ router.get('/dar-history', ah(async (req, res) => {
   });
 }));
 
+// ---------------------------------------------------------------------------
+// PAGE 3 — REPORTING & DRILL-DOWN
+// GET /api/nerc/reporting-feeders?disco=&band=&state=&voltageClass=&search=
+// Filtered feeder list backing the feeder picker — kept separate from the
+// full detail call below so switching Disco/Band/State/Voltage Level
+// doesn't require re-fetching a specific feeder's chart data.
+// ---------------------------------------------------------------------------
+router.get('/reporting-feeders', ah(async (req, res) => {
+  const params = [];
+  const cond = filterCond(req, params, 's');
+  let searchCond = '';
+  if (req.query.search && req.query.search.trim()) {
+    params.push(`%${req.query.search.trim()}%`);
+    searchCond = ` AND (s.feeder_name ILIKE $${params.length} OR s.meter_id ILIKE $${params.length})`;
+  }
+  const { rows } = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class, s.connectivity
+    FROM v_meter_status s WHERE 1=1 ${cond} ${searchCond}
+    ORDER BY s.feeder_name NULLS LAST, s.meter_id
+    LIMIT 500`, params);
+  res.json({ feeders: rows });
+}));
 
+// ---------------------------------------------------------------------------
+// GET /api/nerc/reporting-detail?meterId=&from=&to=
+// Full single-feeder deep-dive: latest snapshot numbers, intraday
+// electrical series for the "to" date (voltage/current/frequency/power
+// factor/active/reactive/apparent power — queried live from raw `readings`
+// for this one meter+day rather than the agg_15min continuous aggregate,
+// since that aggregate only averages active power, not reactive/apparent;
+// querying raw readings for a single meter/day is cheap and needs no
+// schema migration), and a From-To daily Load Flow + Energy trend (reusing
+// the same agg_15min-based computation as Pages 1 and 2).
+// ---------------------------------------------------------------------------
+router.get('/reporting-detail', ah(async (req, res) => {
+  const cfg = await getSettings();
+  const meterId = req.query.meterId;
+  if (!meterId) return res.status(400).json({ error: 'meterId is required' });
+  const to = isDate(req.query.to) ? req.query.to : yesterday();
+  let from = isDate(req.query.from) ? req.query.from : (() => {
+    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - 6); return d.toISOString().slice(0, 10);
+  })();
+  if (new Date(from) > new Date(to)) return res.status(400).json({ error: '"from" must be on or before "to"' });
+
+  const feederRes = await pool.query(`SELECT * FROM v_meter_status WHERE meter_id = $1`, [meterId]);
+  if (feederRes.rows.length === 0) return res.status(404).json({ error: 'Feeder not found' });
+  const f = feederRes.rows[0];
+
+  // Intraday series (the "to" date) — live aggregation on raw readings,
+  // 15-minute buckets, for this one meter only.
+  const intraday = await pool.query(`
+    SELECT time_bucket('15 minutes', meter_ts) AS bucket,
+      avg(voltage_l1) v1, avg(voltage_l2) v2, avg(voltage_l3) v3,
+      avg(current_l1) i1, avg(current_l2) i2, avg(current_l3) i3,
+      avg(frequency) freq, avg(power_factor) pf,
+      avg(active_power) p, avg(reactive_power) q, avg(apparent_power) s
+    FROM readings
+    WHERE meter_id = $1 AND meter_ts >= $2::date AND meter_ts < $2::date + interval '1 day'
+    GROUP BY bucket ORDER BY bucket`, [meterId, to]);
+
+  // Daily Load Flow + Energy trend across the From-To range.
+  const daily = await pool.query(`
+    SELECT to_char(bucket, 'YYYY-MM-DD') AS day,
+      avg(avg_active_power) avg_power, max(avg_active_power) peak_power,
+      max(max_active_energy) e_max, min(max_active_energy) e_min
+    FROM agg_15min
+    WHERE meter_id = $1 AND bucket >= $2::date AND bucket < $3::date + interval '1 day'
+    GROUP BY day ORDER BY day`, [meterId, from, to]);
+
+  const kwFactor = f.power_unit === 'W' ? 1 / 1000 : 1;
+  const trend = daily.rows.map((r) => {
+    let energyKwh = null;
+    if (r.e_max != null && r.e_min != null) {
+      energyKwh = +r.e_max - +r.e_min;
+      if (f.energy_unit === 'Wh') energyKwh /= 1000;
+    }
+    return {
+      day: r.day,
+      avgLoadKW: r.avg_power != null ? +(+r.avg_power * kwFactor).toFixed(2) : null,
+      peakLoadKW: r.peak_power != null ? +(+r.peak_power * kwFactor).toFixed(2) : null,
+      energyKwh: energyKwh != null ? +energyKwh.toFixed(1) : null,
+    };
+  });
+
+  res.json({
+    feeder: {
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco, band: f.tariff_band,
+      state: f.state, voltageClass: f.voltage_class, connectivity: f.connectivity,
+      station: f.station, motherFeeder: f.mother_feeder,
+    },
+    snapshot: {
+      voltageL1: f.voltage_l1, voltageL2: f.voltage_l2, voltageL3: f.voltage_l3,
+      currentL1: f.current_l1, currentL2: f.current_l2, currentL3: f.current_l3,
+      frequency: f.frequency, powerFactor: f.power_factor,
+      activePower: f.active_power != null ? +f.active_power * kwFactor : null,
+      reactivePower: f.reactive_power != null ? +f.reactive_power * kwFactor : null,
+      apparentPower: f.apparent_power != null ? +f.apparent_power * kwFactor : null,
+      powerUnit: 'kW', lastReadingAt: f.last_reading_at,
+    },
+    from, to,
+    intraday: intraday.rows.map((r) => ({
+      t: r.bucket, v1: r.v1, v2: r.v2, v3: r.v3, i1: r.i1, i2: r.i2, i3: r.i3,
+      freq: r.freq, pf: r.pf,
+      p: r.p != null ? +r.p * kwFactor : null,
+      q: r.q != null ? +r.q * kwFactor : null,
+      s: r.s != null ? +r.s * kwFactor : null,
+    })),
+    trend,
+  });
+}));
+
+// ---------------------------------------------------------------------------
+// GET /api/nerc/summary?disco=   -> all 12 dashboard tiles (live + daily)
+// ---------------------------------------------------------------------------
 router.get('/summary', ah(async (req, res) => {
   const cfg = await getSettings();
   const params = [];
