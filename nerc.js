@@ -14,22 +14,26 @@ const ah = (fn) => (req, res) => fn(req, res).catch((err) => {
   res.status(500).json({ error: err.message });
 });
 const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const yesterday = () => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); };
 
-// Builds "AND alias.disco = $n AND alias.tariff_band = $m" (or WHERE variant),
-// appending values to the given params array. Shared by every NERC endpoint
-// so DisCo + Band always filter together, the same way, everywhere.
+// Builds "AND alias.disco = $n AND alias.tariff_band = $m ..." (or WHERE
+// variant), appending values to the given params array. Shared by every
+// NERC endpoint so Disco + Band + State + Voltage Level always filter
+// together, the same way, everywhere.
 function filterCond(req, params, alias, keyword = 'AND') {
   const col = (name) => (alias ? `${alias}.${name}` : name);
   let cond = '';
-  if (req.query.disco && req.query.disco !== 'all') {
-    params.push(req.query.disco);
-    cond += ` ${keyword} ${col('disco')} = $${params.length}`;
-    keyword = 'AND';
-  }
-  if (req.query.band && req.query.band !== 'all') {
-    params.push(req.query.band);
-    cond += ` ${keyword} ${col('tariff_band')} = $${params.length}`;
-  }
+  const add = (queryKey, column) => {
+    if (req.query[queryKey] && req.query[queryKey] !== 'all') {
+      params.push(req.query[queryKey]);
+      cond += ` ${keyword} ${col(column)} = $${params.length}`;
+      keyword = 'AND';
+    }
+  };
+  add('disco', 'disco');
+  add('band', 'tariff_band');
+  add('state', 'state');
+  add('voltageClass', 'voltage_class');
   return cond;
 }
 
@@ -37,6 +41,123 @@ function filterCond(req, params, alias, keyword = 'AND') {
 const KW = "CASE WHEN s.power_unit = 'W' THEN s.active_power / 1000.0 ELSE s.active_power END";
 // energy normalised to kWh
 const KWH = (col) => `CASE WHEN m.energy_unit = 'Wh' THEN (${col}) / 1000.0 ELSE (${col}) END`;
+
+// ---------------------------------------------------------------------------
+// PAGE 1 — EXECUTIVE SUMMARY
+// GET /api/nerc/executive-summary?date=&disco=&band=&state=&voltageClass=
+// Fleet status for a single day: online/offline, DAR, Availability
+// (hours supplied ÷ hours required for each feeder's Band — the same
+// formula used by monthly Performance Categorization, just for one day),
+// energy, and load (avg + peak), fleet-wide and broken down by Disco.
+// Defaults to yesterday since "today" is always a partial day.
+// ---------------------------------------------------------------------------
+router.get('/executive-summary', ah(async (req, res) => {
+  const cfg = await getSettings();
+  const date = isDate(req.query.date) ? req.query.date : yesterday();
+  const minHours = { A: +cfg.sbt_hours_band_a, B: +cfg.sbt_hours_band_b, C: +cfg.sbt_hours_band_c,
+    D: +cfg.sbt_hours_band_d, E: +cfg.sbt_hours_band_e };
+
+  const params = [];
+  const cond = filterCond(req, params, 's');
+  const feedersRes = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class,
+           s.connectivity, s.power_unit, s.energy_unit
+    FROM v_meter_status s
+    WHERE 1=1 ${cond}`, params);
+  const feeders = feedersRes.rows;
+
+  if (feeders.length === 0) {
+    return res.json({
+      date, feeders: 0, online: 0, offline: 0, avgDarPct: null, availabilityPct: null,
+      totalEnergyKwh: 0, avgLoadKW: null, peakLoadKW: null, discos: [],
+    });
+  }
+  const meterIds = feeders.map((f) => f.meter_id);
+
+  // One pass over agg_15min covers hours-supplied (via the same configurable
+  // current-flow threshold used everywhere else, not agg_nerc_15min's
+  // separate hardcoded one — see the SBT Scorecard fix earlier), average
+  // and peak load, and daily energy (cumulative register delta).
+  const agg = await pool.query(`
+    SELECT meter_id,
+      count(*) FILTER (WHERE GREATEST(avg_current_l1, avg_current_l2, avg_current_l3) > $1) AS on_buckets,
+      avg(avg_active_power) AS avg_power, max(avg_active_power) AS peak_power,
+      max(max_active_energy) AS e_max, min(max_active_energy) AS e_min
+    FROM agg_15min
+    WHERE meter_id = ANY($2) AND bucket >= $3::date AND bucket < $3::date + interval '1 day'
+    GROUP BY meter_id`, [+cfg.current_flow_threshold, meterIds, date]);
+  const byMeter = {};
+  agg.rows.forEach((r) => { byMeter[r.meter_id] = r; });
+
+  const darRes = await pool.query(`
+    SELECT meter_id, dar_pct FROM v_dar_daily
+    WHERE meter_id = ANY($1) AND day = $2::date`, [meterIds, date]);
+  const darByMeter = {};
+  darRes.rows.forEach((r) => { darByMeter[r.meter_id] = +r.dar_pct; });
+
+  let online = 0, offline = 0, sumActual = 0, sumRequired = 0, sumEnergy = 0;
+  let sumAvgPower = 0, powerCount = 0, peakLoadKW = 0, sumDar = 0, darCount = 0;
+  const byDisco = {};
+
+  feeders.forEach((f) => {
+    const isOnline = f.connectivity === 'online';
+    if (isOnline) online++; else offline++;
+
+    const a = byMeter[f.meter_id];
+    const actualHours = a ? Math.min(24, +a.on_buckets * 0.25) : 0;
+    const need = minHours[f.tariff_band];
+
+    let energyKwh = 0;
+    if (a && a.e_max != null && a.e_min != null) {
+      energyKwh = +a.e_max - +a.e_min;
+      if (f.energy_unit === 'Wh') energyKwh /= 1000;
+    }
+    let avgPowerKW = null, peakPowerKW = null;
+    if (a && a.avg_power != null) avgPowerKW = f.power_unit === 'W' ? +a.avg_power / 1000 : +a.avg_power;
+    if (a && a.peak_power != null) peakPowerKW = f.power_unit === 'W' ? +a.peak_power / 1000 : +a.peak_power;
+
+    const dar = darByMeter[f.meter_id];
+    if (dar != null) { sumDar += dar; darCount++; }
+    if (need != null) { sumActual += actualHours; sumRequired += need; }
+    sumEnergy += energyKwh;
+    if (avgPowerKW != null) { sumAvgPower += avgPowerKW; powerCount++; }
+    if (peakPowerKW != null && peakPowerKW > peakLoadKW) peakLoadKW = peakPowerKW;
+
+    const dk = f.disco || 'Unassigned';
+    const d = byDisco[dk] || (byDisco[dk] = {
+      disco: dk, feeders: 0, online: 0, offline: 0,
+      actual: 0, required: 0, energy: 0, avgPowerSum: 0, avgPowerCount: 0, peakPower: 0,
+      darSum: 0, darCount: 0,
+    });
+    d.feeders++;
+    if (isOnline) d.online++; else d.offline++;
+    if (need != null) { d.actual += actualHours; d.required += need; }
+    d.energy += energyKwh;
+    if (avgPowerKW != null) { d.avgPowerSum += avgPowerKW; d.avgPowerCount++; }
+    if (peakPowerKW != null && peakPowerKW > d.peakPower) d.peakPower = peakPowerKW;
+    if (dar != null) { d.darSum += dar; d.darCount++; }
+  });
+
+  const pct = (a, b) => (b > 0 ? Math.min(100, +(a / b * 100).toFixed(1)) : null);
+  const discos = Object.values(byDisco).map((d) => ({
+    disco: d.disco, feeders: d.feeders, online: d.online, offline: d.offline,
+    avgDarPct: d.darCount ? +(d.darSum / d.darCount).toFixed(1) : null,
+    availabilityPct: pct(d.actual, d.required),
+    energyKwh: +d.energy.toFixed(1),
+    avgLoadKW: d.avgPowerCount ? +(d.avgPowerSum / d.avgPowerCount).toFixed(1) : null,
+    peakLoadKW: +d.peakPower.toFixed(1),
+  })).sort((a, b) => a.disco.localeCompare(b.disco));
+
+  res.json({
+    date, feeders: feeders.length, online, offline,
+    avgDarPct: darCount ? +(sumDar / darCount).toFixed(1) : null,
+    availabilityPct: pct(sumActual, sumRequired),
+    totalEnergyKwh: +sumEnergy.toFixed(1),
+    avgLoadKW: powerCount ? +(sumAvgPower / powerCount).toFixed(1) : null,
+    peakLoadKW: +peakLoadKW.toFixed(1),
+    discos,
+  });
+}));
 
 // ---------------------------------------------------------------------------
 // GET /api/nerc/summary?disco=   -> all 12 dashboard tiles (live + daily)
@@ -377,7 +498,6 @@ async function computeSbtScorecard(req) {
 // Scorecard, since "today" is always partial.
 // ---------------------------------------------------------------------------
 router.get('/league-table', ah(async (req, res) => {
-  const yesterday = () => { const d = new Date(); d.setUTCDate(d.getUTCDate() - 1); return d.toISOString().slice(0, 10); };
   const date = isDate(req.query.date) ? req.query.date : yesterday();
   const compareDays = Math.max(1, +req.query.compareDays || 7);
   const compareDate = (() => {

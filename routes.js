@@ -81,6 +81,31 @@ router.get('/bands', ah(async (_req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// List of States in use (for filter dropdowns) — Executive Summary / DAR
+// history / Reporting pages all filter by State alongside Disco/Band.
+// GET /api/states
+// ---------------------------------------------------------------------------
+router.get('/states', ah(async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT state, count(*) AS feeders FROM meters
+     WHERE state IS NOT NULL AND status <> 'decommissioned'
+     GROUP BY state ORDER BY state`);
+  res.json(rows);
+}));
+
+// ---------------------------------------------------------------------------
+// List of Voltage Classes in use (for filter dropdowns)
+// GET /api/voltage-classes
+// ---------------------------------------------------------------------------
+router.get('/voltage-classes', ah(async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT voltage_class, count(*) AS feeders FROM meters
+     WHERE voltage_class IS NOT NULL AND status <> 'decommissioned'
+     GROUP BY voltage_class ORDER BY voltage_class`);
+  res.json(rows);
+}));
+
+// ---------------------------------------------------------------------------
 // FEATURE 4: Feeder status - all / online / offline, filterable by Disco and
 // Band, paginated so a fleet of thousands of feeders stays fast and compact
 // in the UI (page/limit query params; limit=all disables paging).
