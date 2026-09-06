@@ -189,8 +189,94 @@ router.get('/executive-summary', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// GET /api/nerc/summary?disco=   -> all 12 dashboard tiles (live + daily)
+// PAGE 2 — HISTORICAL DAR ACROSS ALL SUBSTATIONS
+// GET /api/nerc/dar-history?from=&to=&disco=&band=&state=&voltageClass=&page=&limit=
+// A substation x date matrix of DAR%, plus a filtered-scope daily average
+// trend line. The date control here is deliberately a From/To RANGE, kept
+// separate from Page 1's single-date filter, per the NERC request.
 // ---------------------------------------------------------------------------
+router.get('/dar-history', ah(async (req, res) => {
+  const to = isDate(req.query.to) ? req.query.to : yesterday();
+  let from = isDate(req.query.from) ? req.query.from : (() => {
+    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - 13); return d.toISOString().slice(0, 10);
+  })();
+  // Cap the range so a huge, unbounded request can't be built by mistake —
+  // a quarter's worth of daily columns is already a very wide table.
+  const MAX_DAYS = 92;
+  const spanDays = Math.round((new Date(to) - new Date(from)) / 86400000) + 1;
+  if (spanDays > MAX_DAYS) {
+    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - (MAX_DAYS - 1));
+    from = d.toISOString().slice(0, 10);
+  }
+  if (new Date(from) > new Date(to)) return res.status(400).json({ error: '"from" must be on or before "to"' });
+
+  const params = [];
+  const cond = filterCond(req, params, 's');
+  const feedersRes = await pool.query(`
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class
+    FROM v_meter_status s WHERE 1=1 ${cond}
+    ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
+  const feeders = feedersRes.rows;
+
+  const days = [];
+  for (let d = new Date(from + 'T00:00:00Z'); d <= new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() + 1)) {
+    days.push(d.toISOString().slice(0, 10));
+  }
+
+  if (feeders.length === 0) {
+    return res.json({ from, to, days, dailyAvg: days.map((day) => ({ day, avgDarPct: null })),
+      page: 1, limit: 25, totalPages: 1, total: 0, feederRows: [] });
+  }
+  const meterIds = feeders.map((f) => f.meter_id);
+
+  const darRes = await pool.query(`
+    SELECT meter_id, to_char(day, 'YYYY-MM-DD') AS day, dar_pct FROM v_dar_daily
+    WHERE meter_id = ANY($1) AND day >= $2::date AND day <= $3::date`, [meterIds, from, to]);
+  const byMeter = {};
+  darRes.rows.forEach((r) => { (byMeter[r.meter_id] = byMeter[r.meter_id] || {})[r.day] = +r.dar_pct; });
+
+  // Fleet/filtered-scope daily average — computed over ALL matching
+  // feeders regardless of the table's own pagination below, so the trend
+  // line always reflects the full filtered set.
+  const dailyAvg = days.map((day) => {
+    let sum = 0, count = 0;
+    feeders.forEach((f) => {
+      const v = (byMeter[f.meter_id] || {})[day];
+      if (v != null) { sum += v; count++; }
+    });
+    return { day, avgDarPct: count ? +(sum / count).toFixed(1) : null };
+  });
+
+  // Paginate the feeder rows that back the matrix table — each row is
+  // "wide" (one cell per day), so a smaller default page size than other
+  // tables keeps this readable.
+  const total = feeders.length;
+  const limitRaw = (req.query.limit || '').toLowerCase();
+  const limit = limitRaw === 'all' ? total : Math.min(200, Math.max(1, +req.query.limit || 25));
+  const page = Math.max(1, +req.query.page || 1);
+  const totalPages = Math.max(1, Math.ceil(total / (limit || 1)));
+  const start = (Math.min(page, totalPages) - 1) * limit;
+  const pageFeeders = limitRaw === 'all' ? feeders : feeders.slice(start, start + limit);
+
+  const feederRows = pageFeeders.map((f) => {
+    const vals = days.map((day) => (byMeter[f.meter_id] || {})[day] ?? null);
+    const present = vals.filter((v) => v != null);
+    return {
+      meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco,
+      band: f.tariff_band, state: f.state, voltageClass: f.voltage_class,
+      values: vals,
+      avgDarPct: present.length ? +(present.reduce((a, v) => a + v, 0) / present.length).toFixed(1) : null,
+    };
+  });
+
+  res.json({
+    from, to, days, dailyAvg,
+    page: Math.min(page, totalPages), limit: limitRaw === 'all' ? 'all' : limit, totalPages, total,
+    feederRows,
+  });
+}));
+
+
 router.get('/summary', ah(async (req, res) => {
   const cfg = await getSettings();
   const params = [];
