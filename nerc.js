@@ -322,17 +322,30 @@ router.get('/reporting-detail', ah(async (req, res) => {
   const cfg = await getSettings();
   const meterId = req.query.meterId;
   if (!meterId) return res.status(400).json({ error: 'meterId is required' });
+
+  // Resolution is user-selectable (not auto-picked from the span anymore).
+  // Whitelisted against SQL injection since it's interpolated directly into
+  // time_bucket() below. A finer resolution caps the date range harder,
+  // since it queries raw (unaggregated) readings across the whole span for
+  // one meter — 1-minute buckets over a wide range would both be slow and
+  // produce an unreadably dense chart.
+  const RESOLUTIONS = {
+    '1 minute': 1, '5 minutes': 3, '15 minutes': 7, '30 minutes': 14, '1 hour': 92,
+  };
+  const bucketSize = Object.prototype.hasOwnProperty.call(RESOLUTIONS, req.query.resolution)
+    ? req.query.resolution : '15 minutes';
+  const maxDays = RESOLUTIONS[bucketSize];
+
   const to = isDate(req.query.to) ? req.query.to : yesterday();
   let from = isDate(req.query.from) ? req.query.from : (() => {
-    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - 6); return d.toISOString().slice(0, 10);
+    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - (maxDays - 1)); return d.toISOString().slice(0, 10);
   })();
   if (new Date(from) > new Date(to)) return res.status(400).json({ error: '"from" must be on or before "to"' });
-  // Cap the range — this now queries raw readings (not a pre-aggregated
-  // table) across the full span for one meter, so an unbounded range could
-  // scan a very large number of rows.
-  const MAX_DAYS = 92;
-  if (Math.round((new Date(to) - new Date(from)) / 86400000) + 1 > MAX_DAYS) {
-    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - (MAX_DAYS - 1));
+  // Cap the range to whatever the selected resolution allows — a lower
+  // (finer) resolution collapses the maximum viewable range; a higher
+  // (coarser) one allows a wider range, up to the overall 92-day ceiling.
+  if (Math.round((new Date(to) - new Date(from)) / 86400000) + 1 > maxDays) {
+    const d = new Date(to + 'T00:00:00Z'); d.setUTCDate(d.getUTCDate() - (maxDays - 1));
     from = d.toISOString().slice(0, 10);
   }
 
@@ -340,12 +353,7 @@ router.get('/reporting-detail', ah(async (req, res) => {
   if (feederRes.rows.length === 0) return res.status(404).json({ error: 'Feeder not found' });
   const f = feederRes.rows[0];
 
-  // Electrical series now span the FULL From-To range, like Load Flow and
-  // Energy already did — not just the "to" day. Bucket size adapts to the
-  // span so a wide range doesn't produce thousands of unreadable points:
-  // fine-grained for a few days, coarser as the range grows.
-  const spanDays = Math.round((new Date(to) - new Date(from)) / 86400000) + 1;
-  const bucketSize = spanDays <= 3 ? '15 minutes' : spanDays <= 14 ? '1 hour' : '1 day';
+  // Electrical series span the FULL From-To range at the selected resolution.
   const intraday = await pool.query(`
     SELECT time_bucket('${bucketSize}', meter_ts) AS bucket,
       avg(voltage_l1) v1, avg(voltage_l2) v2, avg(voltage_l3) v3,
@@ -395,7 +403,7 @@ router.get('/reporting-detail', ah(async (req, res) => {
       apparentPower: f.apparent_power != null ? +f.apparent_power * kwFactor : null,
       powerUnit: 'kW', lastReadingAt: f.last_reading_at,
     },
-    from, to, intradayBucket: bucketSize,
+    from, to, intradayBucket: bucketSize, maxDaysForResolution: maxDays,
     intraday: intraday.rows.map((r) => ({
       t: r.bucket, v1: r.v1, v2: r.v2, v3: r.v3, i1: r.i1, i2: r.i2, i3: r.i3,
       freq: r.freq, pf: r.pf,
