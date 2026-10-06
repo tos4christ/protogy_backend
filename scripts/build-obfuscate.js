@@ -23,7 +23,7 @@ const JavaScriptObfuscator = require('javascript-obfuscator');
 const SRC_ENTRY = path.join(__dirname, '..', 'src', 'server.js');
 const OUT_FILE = path.join(__dirname, '..', 'server.js');
 const TMP_BUNDLE = path.join(__dirname, '..', '.build-tmp-bundle.js');
-  
+
 async function main() {
   console.log('[1/3] Bundling src/ with esbuild (node_modules kept external)...');
   await esbuild.build({
