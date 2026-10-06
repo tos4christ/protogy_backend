@@ -3,7 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const pool = require('./db');
+const pool = require('./db'); 
 
 const SECRET = process.env.JWT_SECRET;
 if (!SECRET) { console.error('FATAL: JWT_SECRET not set in .env'); process.exit(1); }
