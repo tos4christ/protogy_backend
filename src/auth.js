@@ -130,6 +130,15 @@ router.post('/users', requireAuth, requireProtogyAdmin, async (req, res) => {
     const { rows: existingRows } = await pool.query('SELECT username FROM app_users WHERE username = $1', [username]);
     const isUpdate = existingRows.length > 0;
 
+    // Guard against self-demotion: the create/update form defaults to
+    // 'protogy_user', and re-submitting your OWN username (e.g. to just
+    // change your password) with that default left in place would silently
+    // strip your own admin rights - same failure class as the existing
+    // can't-deactivate/can't-delete-self guards elsewhere in this file.
+    if (isUpdate && username === req.user.sub && accountType !== 'protogy_admin') {
+      return res.status(400).json({ error: 'You cannot change your own account away from Protogy Admin' });
+    }
+
     const hash = await bcrypt.hash(password, 10);
     const role = legacyRole(accountType);
     const discoVal = accountType === 'disco' ? disco : null;
@@ -223,20 +232,63 @@ router.get('/users', requireAuth, requireProtogyAdmin, async (_req, res) => {
   }
 });
 
+const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+
+// Shared by the on-screen list and the CSV export below, so a filtered view
+// on screen always matches what gets downloaded.
+// ?username=&action=&from=YYYY-MM-DD&to=YYYY-MM-DD
+function buildAuditConds(req) {
+  const conds = [];
+  const params = [];
+  if (req.query.username) { params.push(req.query.username); conds.push(`username = $${params.length}`); }
+  if (req.query.action) { params.push(req.query.action); conds.push(`action = $${params.length}`); }
+  if (isDate(req.query.from)) { params.push(req.query.from); conds.push(`at >= $${params.length}::date`); }
+  if (isDate(req.query.to)) { params.push(req.query.to); conds.push(`at < $${params.length}::date + interval '1 day'`); }
+  return { conds, params };
+}
+
 // GET /api/auth/audit-log  (Protogy Admin only) - recent audit trail.
-// ?limit=200&username=&action=
+// ?limit=200&username=&action=&from=&to=
 router.get('/audit-log', requireAuth, requireProtogyAdmin, async (req, res) => {
   try {
     const limit = Math.min(1000, Math.max(1, +req.query.limit || 200));
-    const conds = [];
-    const params = [];
-    if (req.query.username) { params.push(req.query.username); conds.push(`username = $${params.length}`); }
-    if (req.query.action) { params.push(req.query.action); conds.push(`action = $${params.length}`); }
+    const { conds, params } = buildAuditConds(req);
     const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
     params.push(limit);
     const { rows } = await pool.query(
       `SELECT * FROM audit_log ${where} ORDER BY at DESC LIMIT $${params.length}`, params);
     res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/auth/audit-log/download  (Protogy Admin only) - same filters as
+// above (?username=&action=&from=&to=), streamed as CSV instead of capped
+// JSON - the export has no 1000-row ceiling, since "download the full audit
+// trail for this period" is the whole point. Accepts ?token= same as every
+// other download link in the app, since <a download> can't send headers.
+router.get('/audit-log/download', requireAuth, requireProtogyAdmin, async (req, res) => {
+  try {
+    const { conds, params } = buildAuditConds(req);
+    const where = conds.length ? `WHERE ${conds.join(' AND ')}` : '';
+    const { rows } = await pool.query(
+      `SELECT at, username, account_type, action, target, detail, ip FROM audit_log ${where} ORDER BY at DESC`,
+      params);
+
+    await audit.log(req, 'data_download', { target: 'audit_log', detail: { rows: rows.length } });
+
+    const esc = (v) => {
+      if (v == null) return '';
+      const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const cols = ['at', 'username', 'account_type', 'action', 'target', 'detail', 'ip'];
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="audit_log_${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.write(cols.join(',') + '\n');
+    rows.forEach((r) => { res.write(cols.map((c) => esc(r[c])).join(',') + '\n'); });
+    res.end();
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
