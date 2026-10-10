@@ -5,6 +5,8 @@ const pool = require('./db');
 
 const { requireAdmin } = require('./auth');
 const { getSettings } = require('./settings');
+const { scopeOf, applyScope, requireMeterInScope } = require('./scope');
+const audit = require('./audit');
 const router = express.Router();
 const V_THR = +(process.env.VOLTAGE_PRESENT_THRESHOLD || 50);
 const I_THR = +(process.env.CURRENT_PRESENT_THRESHOLD || 0.5);
@@ -48,23 +50,29 @@ router.post('/meters', requireAdmin, ah(async (req, res) => {
 // ---------------------------------------------------------------------------
 router.get('/meters', ah(async (req, res) => {
   const params = [];
-  let where = "status <> 'decommissioned'";
-  if (req.query.disco) { params.push(req.query.disco); where += ` AND disco = $${params.length}`; }
+  const conds = ["status <> 'decommissioned'"];
+  applyScope(req, conds, params);
   const { rows } = await pool.query(
     `SELECT meter_id, feeder_name, disco, location, status, expected_interval_s, controller_id, onboarded_at
-     FROM meters WHERE ${where} ORDER BY feeder_name NULLS LAST, meter_id`, params);
+     FROM meters WHERE ${conds.join(' AND ')} ORDER BY feeder_name NULLS LAST, meter_id`, params);
   res.json(rows);
 }));
 
 // ---------------------------------------------------------------------------
-// List of Discos in use (for filter dropdowns)
+// List of Discos in use (for filter dropdowns) — scoped so a DisCo account
+// only ever sees itself, and a State NERC account only sees DisCos that
+// actually operate feeders in their assigned state(s); otherwise the
+// dropdown itself would leak which other DisCos exist and their feeder
+// counts to an account that isn't authorized to see them.
 // GET /api/discos
 // ---------------------------------------------------------------------------
-router.get('/discos', ah(async (_req, res) => {
+router.get('/discos', ah(async (req, res) => {
+  const params = [];
+  const conds = ["disco IS NOT NULL", "status <> 'decommissioned'"];
+  applyScope(req, conds, params);
   const { rows } = await pool.query(
     `SELECT disco, count(*) AS feeders FROM meters
-     WHERE disco IS NOT NULL AND status <> 'decommissioned'
-     GROUP BY disco ORDER BY disco`);
+     WHERE ${conds.join(' AND ')} GROUP BY disco ORDER BY disco`, params);
   res.json(rows);
 }));
 
@@ -85,11 +93,13 @@ router.get('/bands', ah(async (_req, res) => {
 // history / Reporting pages all filter by State alongside Disco/Band.
 // GET /api/states
 // ---------------------------------------------------------------------------
-router.get('/states', ah(async (_req, res) => {
+router.get('/states', ah(async (req, res) => {
+  const params = [];
+  const conds = ["state IS NOT NULL", "status <> 'decommissioned'"];
+  applyScope(req, conds, params);
   const { rows } = await pool.query(
     `SELECT state, count(*) AS feeders FROM meters
-     WHERE state IS NOT NULL AND status <> 'decommissioned'
-     GROUP BY state ORDER BY state`);
+     WHERE ${conds.join(' AND ')} GROUP BY state ORDER BY state`, params);
   res.json(rows);
 }));
 
@@ -117,7 +127,7 @@ router.get('/meters/status', ah(async (req, res) => {
   const params = [];
   if (filter === 'online') conds.push("connectivity = 'online'");
   else if (filter === 'offline') conds.push("connectivity IN ('offline','never_reported')");
-  if (req.query.disco) { params.push(req.query.disco); conds.push(`disco = $${params.length}`); }
+  applyScope(req, conds, params);
   if (req.query.band) { params.push(req.query.band); conds.push(`tariff_band = $${params.length}`); }
   let sql = 'SELECT * FROM v_meter_status';
   if (conds.length) sql += ' WHERE ' + conds.join(' AND ');
@@ -145,7 +155,7 @@ router.get('/meters/status', ah(async (req, res) => {
 // FEATURE 6: All details about a feeder (registry + latest reading + 24h stats)
 // GET /api/meters/:id
 // ---------------------------------------------------------------------------
-router.get('/meters/:id', ah(async (req, res) => {
+router.get('/meters/:id', requireMeterInScope, ah(async (req, res) => {
   const id = req.params.id;
   const meter = await pool.query('SELECT * FROM meters WHERE meter_id = $1', [id]);
   if (meter.rows.length === 0) return res.status(404).json({ error: 'meter not found' });
@@ -165,7 +175,7 @@ router.get('/meters/:id', ah(async (req, res) => {
 // FEATURE 2: Paginated readings for a selected date
 // GET /api/meters/:id/readings?date=YYYY-MM-DD&page=1&limit=100&order=asc|desc
 // ---------------------------------------------------------------------------
-router.get('/meters/:id/readings', ah(async (req, res) => {
+router.get('/meters/:id/readings', requireMeterInScope, ah(async (req, res) => {
   const { id } = req.params;
   const { date } = req.query;
   if (!isDate(date)) return res.status(400).json({ error: 'date=YYYY-MM-DD is required' });
@@ -207,7 +217,7 @@ router.get('/meters/:id/readings', ah(async (req, res) => {
 // GET /api/meters/:id/dar?from=YYYY-MM-DD&to=YYYY-MM-DD
 // GET /api/meters/:id/dar?date=YYYY-MM-DD&resolution=15min   (intra-day view)
 // ---------------------------------------------------------------------------
-router.get('/meters/:id/dar', ah(async (req, res) => {
+router.get('/meters/:id/dar', requireMeterInScope, ah(async (req, res) => {
   const { id } = req.params;
   const { from, to, days, date, resolution } = req.query;
 
@@ -250,7 +260,7 @@ router.get('/meters/:id/dar', ah(async (req, res) => {
 // unaccounted     : intervals where no data arrived (gaps)
 // All values in seconds; frontend converts to h/m/s.
 // ---------------------------------------------------------------------------
-router.get('/meters/:id/uptime', ah(async (req, res) => {
+router.get('/meters/:id/uptime', requireMeterInScope, ah(async (req, res) => {
   const { id } = req.params;
   const { date } = req.query;
   if (!isDate(date)) return res.status(400).json({ error: 'date=YYYY-MM-DD is required' });
@@ -294,7 +304,7 @@ router.get('/meters/:id/uptime', ah(async (req, res) => {
 // A gap = no reading for more than 2x the expected interval. Includes edge
 // gaps (midnight -> first reading, last reading -> end of day / now).
 // ---------------------------------------------------------------------------
-router.get('/meters/:id/gaps', ah(async (req, res) => {
+router.get('/meters/:id/gaps', requireMeterInScope, ah(async (req, res) => {
   const { id } = req.params;
   const { date } = req.query;
   if (!isDate(date)) return res.status(400).json({ error: 'date=YYYY-MM-DD is required' });
@@ -328,12 +338,13 @@ router.get('/meters/:id/gaps', ah(async (req, res) => {
 // FEATURE 7: Download readings as CSV for a selected duration (streamed)
 // GET /api/meters/:id/download?from=YYYY-MM-DD&to=YYYY-MM-DD
 // ---------------------------------------------------------------------------
-router.get('/meters/:id/download', ah(async (req, res) => {
+router.get('/meters/:id/download', requireMeterInScope, ah(async (req, res) => {
   const { id } = req.params;
   const { from, to } = req.query;
   if (!isDate(from) || !isDate(to)) {
     return res.status(400).json({ error: 'from and to (YYYY-MM-DD) are required' });
   }
+  audit.log(req, 'data_download', { target: id, detail: { from, to } });
   const cols = ['meter_ts', 'received_ts', 'voltage_l1', 'voltage_l2', 'voltage_l3',
     'current_l1', 'current_l2', 'current_l3', 'frequency', 'power_factor',
     'active_power', 'reactive_power', 'apparent_power',
@@ -382,7 +393,7 @@ router.get('/meters/:id/download', ah(async (req, res) => {
 router.get('/dashboard/overview', ah(async (req, res) => {
   const params = [];
   const conds = [];
-  if (req.query.disco) { params.push(req.query.disco); conds.push(`s.disco = $${params.length}`); }
+  applyScope(req, conds, params, 's');
   if (req.query.band) { params.push(req.query.band); conds.push(`s.tariff_band = $${params.length}`); }
   const whereCond = conds.length ? ` WHERE ${conds.join(' AND ')}` : '';
   const { rows } = await pool.query(
@@ -462,7 +473,7 @@ router.get('/dashboard/power-quality', ah(async (req, res) => {
 
   const params = [];
   const conds = ["s.connectivity = 'online'"];
-  if (req.query.disco) { params.push(req.query.disco); conds.push(`s.disco = $${params.length}`); }
+  applyScope(req, conds, params, 's');
   if (req.query.band) { params.push(req.query.band); conds.push(`s.tariff_band = $${params.length}`); }
   const { rows } = await pool.query(`
     SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band,
@@ -524,7 +535,7 @@ router.get('/dashboard/power-quality', ah(async (req, res) => {
 // CHART SERIES: 15-min averaged electrical values for a date (from agg_15min)
 // GET /api/meters/:id/series?date=YYYY-MM-DD
 // ---------------------------------------------------------------------------
-router.get('/meters/:id/series', ah(async (req, res) => {
+router.get('/meters/:id/series', requireMeterInScope, ah(async (req, res) => {
   const { id } = req.params;
   const { date } = req.query;
   if (!isDate(date)) return res.status(400).json({ error: 'date=YYYY-MM-DD is required' });

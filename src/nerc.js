@@ -5,6 +5,8 @@ const ExcelJS = require('exceljs');
 const pool = require('./db');
 const { requireAuth } = require('./auth');
 const { getSettings } = require('./settings');
+const { scopeOf } = require('./scope');
+const audit = require('./audit');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -30,9 +32,43 @@ function filterCond(req, params, alias, keyword = 'AND') {
       keyword = 'AND';
     }
   };
-  add('disco', 'disco');
+
+  // Server-enforced account scope (DisCo / State NERC) — NEVER driven by the
+  // client's own ?disco=/?state= query params, per the NERC directive that
+  // authorization must be validated server-side, not left to the UI. A
+  // DisCo account's disco filter is always forced to its own disco; a State
+  // NERC account's state filter is always restricted to its assigned states
+  // (one or more), optionally narrowed by a client ?state= that falls
+  // within that assignment. Full-scope accounts (protogy_admin, protogy_user,
+  // nerc) keep the original client-filterable behavior below.
+  const scope = scopeOf(req.user);
+  if (scope.kind === 'disco') {
+    params.push(scope.disco);
+    cond += ` ${keyword} ${col('disco')} = $${params.length}`;
+    keyword = 'AND';
+  } else if (scope.kind === 'state') {
+    if (!scope.states.length) {
+      cond += ` ${keyword} 1=0`;
+      keyword = 'AND';
+    } else if (req.query.state && req.query.state !== 'all') {
+      if (!scope.states.includes(req.query.state)) {
+        cond += ` ${keyword} 1=0`; // requested state outside this account's assignment
+        keyword = 'AND';
+      } else {
+        params.push(req.query.state);
+        cond += ` ${keyword} ${col('state')} = $${params.length}`;
+        keyword = 'AND';
+      }
+    } else {
+      params.push(scope.states);
+      cond += ` ${keyword} ${col('state')} = ANY($${params.length})`;
+      keyword = 'AND';
+    }
+  } else {
+    add('disco', 'disco');
+    add('state', 'state');
+  }
   add('band', 'tariff_band');
-  add('state', 'state');
   add('voltageClass', 'voltage_class');
   return cond;
 }
@@ -1003,7 +1039,8 @@ function sheetHeader(ws, title, rangeText, columns) {
   });
   hr.commit && hr.commit();
 }
-async function sendWb(res, wb, filename) {
+async function sendWb(req, res, wb, filename) {
+  audit.log(req, 'report_generated', { target: filename });
   res.setHeader('Content-Type',
     'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
@@ -1062,7 +1099,7 @@ router.get('/report/daily-compliant', ah(async (req, res) => {
       compliance >= +cfg.compliance_met_pct ? 'Met' : 'Not Met']);
   });
   ws.columns.forEach((c) => { c.width = 18; });
-  await sendWb(res, wb, `Daily Compliant Feeders Report ${date}.xlsx`);
+  await sendWb(req, res, wb, `Daily Compliant Feeders Report ${date}.xlsx`);
 }));
 
 // ---------------------------------------------------------------------------
@@ -1103,7 +1140,7 @@ router.get('/report/data-acquisition', ah(async (req, res) => {
       })]);
   });
   ws.columns.forEach((c, i) => { c.width = i < 8 ? 20 : 9; });
-  await sendWb(res, wb, `Data Acquisition Report ${from} to ${to}.xlsx`);
+  await sendWb(req, res, wb, `Data Acquisition Report ${from} to ${to}.xlsx`);
 }));
 
 // ---------------------------------------------------------------------------
@@ -1148,7 +1185,7 @@ router.get('/report/month-to-date', ah(async (req, res) => {
       })]);
   });
   ws.columns.forEach((c, i) => { c.width = i < 6 ? 20 : 8; });
-  await sendWb(res, wb, `Month To Date Report ${month}.xlsx`);
+  await sendWb(req, res, wb, `Month To Date Report ${month}.xlsx`);
 }));
 
 // ---------------------------------------------------------------------------
@@ -1177,7 +1214,7 @@ router.get('/report/sbt-scorecard', ah(async (req, res) => {
         : f.readingsToday]);
   });
   ws.columns.forEach((c, i) => { c.width = i < 3 ? 20 : 14; });
-  await sendWb(res, wb, `SBT Compliance Scorecard ${result.date}.xlsx`);
+  await sendWb(req, res, wb, `SBT Compliance Scorecard ${result.date}.xlsx`);
 }));
 
 // ---------------------------------------------------------------------------
@@ -1201,7 +1238,7 @@ router.get('/report/performance-categorization', ah(async (req, res) => {
       f.availabilityPct != null ? f.availabilityPct : 'N/A', f.category || 'N/A']);
   });
   ws.columns.forEach((c, i) => { c.width = i < 3 ? 22 : 16; });
-  await sendWb(res, wb, `Performance Categorization ${result.month}.xlsx`);
+  await sendWb(req, res, wb, `Performance Categorization ${result.month}.xlsx`);
 }));
 
 // ---------------------------------------------------------------------------
