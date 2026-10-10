@@ -11,6 +11,23 @@ const audit = require('./audit');
 const router = express.Router();
 router.use(requireAuth);
 
+// Guard for the NERC View page specifically (tiles, per-Disco executive
+// table, feeder drill-down, and its three regulator Excel reports). Unlike
+// every other page in the app, this one is NOT just data-scoped for a
+// DisCo account - it's blocked entirely, per explicit instruction: the
+// regulator's own compliance view is for NERC (nerc / state_nerc, each
+// still scoped to their own remit via scopeOf) and protogy_admin/
+// protogy_user, never for a DisCo account to see at all, even narrowed to
+// itself. Everything else a DisCo account already uses (Executive Summary,
+// Historical DAR, Reporting, Performance Categorization, SBT Scorecard,
+// League Table) is untouched by this - those stay scoped-but-visible.
+function requireNercView(req, res, next) {
+  if (scopeOf(req.user).kind === 'disco') {
+    return res.status(403).json({ error: 'The NERC View is not available to DisCo accounts' });
+  }
+  next();
+}
+
 const ah = (fn) => (req, res) => fn(req, res).catch((err) => {
   console.error('[nerc]', req.method, req.originalUrl, err.message);
   res.status(500).json({ error: err.message });
@@ -572,7 +589,7 @@ router.get('/performance-categorization', ah(async (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/nerc/summary?disco=   -> all 12 dashboard tiles (live + daily)
 // ---------------------------------------------------------------------------
-router.get('/summary', ah(async (req, res) => {
+router.get('/summary', requireNercView, ah(async (req, res) => {
   const cfg = await getSettings();
   const params = [];
   const discoCond = filterCond(req, params, 's');
@@ -653,7 +670,7 @@ router.get('/summary', ah(async (req, res) => {
 // When ?disco= is set, the table narrows to that single Disco row so it stays
 // in lockstep with the tiles above it and the feeder drill-down/reports below.
 // ---------------------------------------------------------------------------
-router.get('/summary-table', ah(async (req, res) => {
+router.get('/summary-table', requireNercView, ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : null;
   const params = [date];
@@ -689,7 +706,7 @@ router.get('/summary-table', ah(async (req, res) => {
 // This backs the feeder drill-down, so it honours the same ?disco= as the
 // tiles and executive summary above it.
 // ---------------------------------------------------------------------------
-router.get('/compliance', ah(async (req, res) => {
+router.get('/compliance', requireNercView, ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
   const params = [date];
@@ -1056,7 +1073,7 @@ const fmtDay = (d) => {
 // ---------------------------------------------------------------------------
 // GET /api/nerc/report/daily-compliant?date=YYYY-MM-DD&disco=   (.xlsx)
 // ---------------------------------------------------------------------------
-router.get('/report/daily-compliant', ah(async (req, res) => {
+router.get('/report/daily-compliant', requireNercView, ah(async (req, res) => {
   const cfg = await getSettings();
   const date = isDate(req.query.date) ? req.query.date : new Date().toISOString().slice(0, 10);
   const params = [date];
@@ -1105,7 +1122,7 @@ router.get('/report/daily-compliant', ah(async (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/nerc/report/data-acquisition?from=&to=&disco=   (.xlsx, per-day DAR)
 // ---------------------------------------------------------------------------
-router.get('/report/data-acquisition', ah(async (req, res) => {
+router.get('/report/data-acquisition', requireNercView, ah(async (req, res) => {
   const { from, to } = req.query;
   if (!isDate(from) || !isDate(to)) return res.status(400).json({ error: 'from and to (YYYY-MM-DD) required' });
   const params = [];
@@ -1146,7 +1163,7 @@ router.get('/report/data-acquisition', ah(async (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /api/nerc/report/month-to-date?month=YYYY-MM&disco=  (.xlsx, per-day current-uptime hours)
 // ---------------------------------------------------------------------------
-router.get('/report/month-to-date', ah(async (req, res) => {
+router.get('/report/month-to-date', requireNercView, ah(async (req, res) => {
   const month = /^\d{4}-\d{2}$/.test(req.query.month || '')
     ? req.query.month : new Date().toISOString().slice(0, 7);
   const from = month + '-01';
