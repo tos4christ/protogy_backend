@@ -26,12 +26,13 @@ const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
 // ---------------------------------------------------------------------------
 router.post('/meters', requireAdmin, ah(async (req, res) => {
   const { meterId, feederName, location, intervalSeconds, user, metadata, controllerId, disco, latitude, longitude,
-    station, motherFeeder, category, state, voltageClass, nominalVoltage, tariffBand } = req.body;
+    station, motherFeeder, category, state, voltageClass, nominalVoltage, tariffBand,
+    feederType, regulator } = req.body;
   if (!meterId || !feederName) {
     return res.status(400).json({ error: 'meterId and feederName are required' });
   }
   const { rows } = await pool.query(
-    'SELECT * FROM onboard_meter($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)',
+    'SELECT * FROM onboard_meter($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)',
     [meterId, feederName, location || null, intervalSeconds || 15, user || null,
      JSON.stringify(metadata || {}), controllerId || null, disco || null,
      latitude != null && latitude !== '' ? +latitude : null,
@@ -39,9 +40,44 @@ router.post('/meters', requireAdmin, ah(async (req, res) => {
      station || null, motherFeeder || null, category || null, state || null,
      voltageClass || null,
      nominalVoltage != null && nominalVoltage !== '' ? +nominalVoltage : null,
-     tariffBand || null]
+     tariffBand || null, feederType || null, regulator || null]
   );
   res.status(201).json(rows[0]);
+}));
+
+// ---------------------------------------------------------------------------
+// Feeder registry lookup — autofill support for onboarding. Matches the
+// Commission's NESI feeder database (feeder_registry, see
+// migrations/002_feeder_registry.sql) by disco + feeder name so staff can
+// pull Band/State/Regulator/Voltage/FeederType instead of typing it blind.
+// GET /api/feeder-registry/lookup?disco=...&feeder=...
+// ---------------------------------------------------------------------------
+router.get('/feeder-registry/lookup', requireAdmin, ah(async (req, res) => {
+  const { disco, feeder } = req.query;
+  if (!disco || !feeder) return res.status(400).json({ error: 'disco and feeder are required' });
+  const { rows } = await pool.query(
+    `SELECT disco, feeder, band, location, major_streets, state, regulator,
+            voltage_level, unmetered_customers, metered_customers, feeder_type, substation
+     FROM feeder_registry
+     WHERE disco ILIKE $1 AND feeder ILIKE $2
+     ORDER BY imported_at DESC LIMIT 1`,
+    [disco, feeder]);
+  if (!rows.length) return res.status(404).json({ error: 'no match in feeder registry' });
+  res.json(rows[0]);
+}));
+
+// GET /api/feeder-registry/search?disco=...&q=...  (feeder-name typeahead,
+// scoped to a disco so staff aren't picking through ~3,249 national rows)
+router.get('/feeder-registry/search', requireAdmin, ah(async (req, res) => {
+  const { disco, q } = req.query;
+  if (!disco) return res.status(400).json({ error: 'disco is required' });
+  const params = [disco];
+  let cond = 'disco ILIKE $1';
+  if (q && q.trim()) { params.push(`%${q.trim()}%`); cond += ` AND feeder ILIKE $2`; }
+  const { rows } = await pool.query(
+    `SELECT feeder, band, state, regulator, voltage_level, feeder_type, substation
+     FROM feeder_registry WHERE ${cond} ORDER BY feeder LIMIT 25`, params);
+  res.json(rows);
 }));
 
 // ---------------------------------------------------------------------------

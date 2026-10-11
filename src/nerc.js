@@ -7,6 +7,7 @@ const { requireAuth } = require('./auth');
 const { getSettings } = require('./settings');
 const { scopeOf } = require('./scope');
 const audit = require('./audit');
+const { availabilityMetricFor } = require('./feederType');
 
 const router = express.Router();
 router.use(requireAuth);
@@ -114,7 +115,7 @@ router.get('/executive-summary', ah(async (req, res) => {
   const cond = filterCond(req, params, 's');
   const feedersRes = await pool.query(`
     SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class,
-           s.connectivity, s.power_unit, s.energy_unit
+           s.connectivity, s.power_unit, s.energy_unit, s.feeder_type
     FROM v_meter_status s
     WHERE 1=1 ${cond}
     ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
@@ -129,18 +130,27 @@ router.get('/executive-summary', ah(async (req, res) => {
   }
   const meterIds = feeders.map((f) => f.meter_id);
 
-  // One pass over agg_15min covers hours-supplied (via the same configurable
-  // current-flow threshold used everywhere else, not agg_nerc_15min's
-  // separate hardcoded one — see the SBT Scorecard fix earlier), average
-  // and peak load, and daily energy (cumulative register delta).
+  // One pass over agg_15min covers hours-supplied, average and peak load,
+  // and daily energy (cumulative register delta). Hours-supplied is counted
+  // TWO ways per bucket — voltage_on_buckets and load_on_buckets — per the
+  // Commission's feeder-type letter (feederType.js): Public/Commercial
+  // feeders' availability is judged by load, Dedicated/Virtual/Express by
+  // voltage presence (a dedicated customer not drawing load isn't a supply
+  // failure). Each feeder below picks whichever one its own feeder_type
+  // calls for via availabilityMetricFor() — an unclassified feeder (no
+  // feeder_type set yet) falls back to 'load', i.e. unchanged behavior from
+  // before this letter (load/current-flow was already the only metric).
   const agg = await pool.query(`
-    SELECT meter_id,
-      count(*) FILTER (WHERE GREATEST(avg_current_l1, avg_current_l2, avg_current_l3) > $1) AS on_buckets,
-      avg(avg_active_power) AS avg_power, max(avg_active_power) AS peak_power,
-      max(max_active_energy) AS e_max, min(max_active_energy) AS e_min
-    FROM agg_15min
-    WHERE meter_id = ANY($2) AND bucket >= $3::date AND bucket < $3::date + interval '1 day'
-    GROUP BY meter_id`, [+cfg.current_flow_threshold, meterIds, date]);
+    SELECT a.meter_id,
+      count(*) FILTER (WHERE GREATEST(a.avg_voltage_l1, a.avg_voltage_l2, a.avg_voltage_l3) > $1) AS voltage_on_buckets,
+      count(*) FILTER (WHERE (CASE WHEN m.power_unit = 'W' THEN a.avg_active_power / 1000.0 ELSE a.avg_active_power END) > $2) AS load_on_buckets,
+      avg(a.avg_active_power) AS avg_power, max(a.avg_active_power) AS peak_power,
+      max(a.max_active_energy) AS e_max, min(a.max_active_energy) AS e_min
+    FROM agg_15min a
+    JOIN meters m ON m.meter_id = a.meter_id
+    WHERE a.meter_id = ANY($3) AND a.bucket >= $4::date AND a.bucket < $4::date + interval '1 day'
+    GROUP BY a.meter_id`,
+    [+cfg.voltage_present_threshold, +cfg.load_present_threshold_kw, meterIds, date]);
   const byMeter = {};
   agg.rows.forEach((r) => { byMeter[r.meter_id] = r; });
 
@@ -160,7 +170,9 @@ router.get('/executive-summary', ah(async (req, res) => {
     if (isOnline) online++; else offline++;
 
     const a = byMeter[f.meter_id];
-    const actualHours = a ? Math.min(24, +a.on_buckets * 0.25) : 0;
+    const metric = availabilityMetricFor(f.feeder_type);
+    const onBuckets = a ? (metric === 'voltage' ? +a.voltage_on_buckets : +a.load_on_buckets) : 0;
+    const actualHours = a ? Math.min(24, onBuckets * 0.25) : 0;
     const need = minHours[f.tariff_band];
 
     let energyKwh = 0;
@@ -183,7 +195,7 @@ router.get('/executive-summary', ah(async (req, res) => {
     feederRows.push({
       meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco,
       band: f.tariff_band, state: f.state, voltageClass: f.voltage_class,
-      connectivity: f.connectivity,
+      connectivity: f.connectivity, feederType: f.feeder_type, availabilityMetric: metric,
       darPct: dar != null ? +dar.toFixed(1) : null,
       availabilityPct: feederAvailabilityPct,
       energyKwh: +energyKwh.toFixed(1),
@@ -504,7 +516,7 @@ async function computePerformanceCategorization(req) {
     searchCond = ` AND (s.feeder_name ILIKE $${params.length} OR s.meter_id ILIKE $${params.length})`;
   }
   const feedersRes = await pool.query(`
-    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.state, s.voltage_class, s.feeder_type
     FROM v_meter_status s
     WHERE s.tariff_band IS NOT NULL ${cond} ${searchCond}
     ORDER BY s.feeder_name NULLS LAST, s.meter_id`, params);
@@ -517,18 +529,28 @@ async function computePerformanceCategorization(req) {
   };
   if (feeders.length === 0) return emptyResult;
   const meterIds = feeders.map((f) => f.meter_id);
+  const metricByMeter = {};
+  feeders.forEach((f) => { metricByMeter[f.meter_id] = availabilityMetricFor(f.feeder_type); });
 
-  // Hours supplied across the 21-day window — same current-flow-threshold
+  // Hours supplied across the 21-day window — same voltage/load-presence
   // logic used by the SBT Scorecard and Executive Summary, just summed
-  // over more days instead of one.
+  // over more days instead of one. Per the Commission's feeder-type
+  // letter (feederType.js), Dedicated/Virtual/Express feeders are judged
+  // by voltage presence; Public/Commercial (and combinations) by load.
   const hoursRes = await pool.query(`
-    SELECT meter_id,
-      count(*) FILTER (WHERE GREATEST(avg_current_l1, avg_current_l2, avg_current_l3) > $1) AS on_buckets
-    FROM agg_15min
-    WHERE meter_id = ANY($2) AND bucket >= $3::date AND bucket < $4::date + interval '1 day'
-    GROUP BY meter_id`, [+cfg.current_flow_threshold, meterIds, monthStart, monthEnd]);
+    SELECT a.meter_id,
+      count(*) FILTER (WHERE GREATEST(a.avg_voltage_l1, a.avg_voltage_l2, a.avg_voltage_l3) > $1) AS voltage_on_buckets,
+      count(*) FILTER (WHERE (CASE WHEN m.power_unit = 'W' THEN a.avg_active_power / 1000.0 ELSE a.avg_active_power END) > $2) AS load_on_buckets
+    FROM agg_15min a
+    JOIN meters m ON m.meter_id = a.meter_id
+    WHERE a.meter_id = ANY($3) AND a.bucket >= $4::date AND a.bucket < $5::date + interval '1 day'
+    GROUP BY a.meter_id`, [+cfg.voltage_present_threshold, +cfg.load_present_threshold_kw, meterIds, monthStart, monthEnd]);
   const hoursByMeter = {};
-  hoursRes.rows.forEach((r) => { hoursByMeter[r.meter_id] = +r.on_buckets * 0.25; });
+  hoursRes.rows.forEach((r) => {
+    const metric = metricByMeter[r.meter_id];
+    const onBuckets = metric === 'voltage' ? +r.voltage_on_buckets : +r.load_on_buckets;
+    hoursByMeter[r.meter_id] = onBuckets * 0.25;
+  });
 
   const scored = feeders.map((f) => {
     const need = minHours[f.tariff_band];
@@ -544,6 +566,7 @@ async function computePerformanceCategorization(req) {
     return {
       meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco, band: f.tariff_band,
       state: f.state, voltageClass: f.voltage_class,
+      feederType: f.feeder_type, availabilityMetric: metricByMeter[f.meter_id],
       requiredHours, actualHours: +actualHours.toFixed(1), availabilityPct, category,
     };
   });
@@ -782,7 +805,8 @@ async function computeSbtScorecard(req) {
   const params = [];
   const discoCond = filterCond(req, params, 's');
   const feedersRes = await pool.query(`
-    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.expected_interval_s, s.power_unit
+    SELECT s.meter_id, s.feeder_name, s.disco, s.tariff_band, s.expected_interval_s, s.power_unit,
+      s.feeder_type
     FROM v_meter_status s
     WHERE s.tariff_band IS NOT NULL ${discoCond}
     ORDER BY s.disco NULLS LAST, s.feeder_name`, params);
@@ -791,6 +815,8 @@ async function computeSbtScorecard(req) {
     return { date, minHours, tariff, explanationDays, downgradeDays, discos: [], feeders: [] };
   }
   const meterIds = feeders.map((f) => f.meter_id);
+  const metricByMeter = {};
+  feeders.forEach((f) => { metricByMeter[f.meter_id] = availabilityMetricFor(f.feeder_type); });
 
   // Hours-supplied is measured the SAME way as the rest of the app's
   // "current online" logic (cfg.current_flow_threshold), from agg_15min —
@@ -798,12 +824,22 @@ async function computeSbtScorecard(req) {
   // could silently disagree with what Settings/the dashboard consider
   // "current flowing" and made feeders look permanently non-compliant
   // even with real, nonzero current on screen.
+  //
+  // Per the Commission's feeder-type letter (feederType.js), a
+  // Dedicated/Virtual/Express feeder's availability has to be judged by
+  // voltage presence, not load — its one customer may simply not be
+  // drawing load while the feeder is fully energized. Public/Commercial
+  // (and any combination) keep the load-based reading. So both bucket
+  // counts are computed here, and each feeder picks the right one below
+  // via availabilityMetricFor(feeder_type).
   const daily = await pool.query(`
-    SELECT meter_id, to_char(time_bucket('1 day', bucket), 'YYYY-MM-DD') AS day,
-      count(*) FILTER (WHERE GREATEST(avg_current_l1, avg_current_l2, avg_current_l3) > $3) AS on_buckets
-    FROM agg_15min
-    WHERE meter_id = ANY($1) AND bucket >= $2::date - INTERVAL '13 days' AND bucket < $2::date + INTERVAL '1 day'
-    GROUP BY meter_id, day`, [meterIds, date, +cfg.current_flow_threshold]);
+    SELECT a.meter_id, to_char(time_bucket('1 day', a.bucket), 'YYYY-MM-DD') AS day,
+      count(*) FILTER (WHERE GREATEST(a.avg_voltage_l1, a.avg_voltage_l2, a.avg_voltage_l3) > $3) AS voltage_on_buckets,
+      count(*) FILTER (WHERE (CASE WHEN m.power_unit = 'W' THEN a.avg_active_power / 1000.0 ELSE a.avg_active_power END) > $4) AS load_on_buckets
+    FROM agg_15min a
+    JOIN meters m ON m.meter_id = a.meter_id
+    WHERE a.meter_id = ANY($1) AND a.bucket >= $2::date - INTERVAL '13 days' AND a.bucket < $2::date + INTERVAL '1 day'
+    GROUP BY a.meter_id, day`, [meterIds, date, +cfg.voltage_present_threshold, +cfg.load_present_threshold_kw]);
   const byMeterDay = {};
   daily.rows.forEach((r) => {
     const k = r.meter_id;
@@ -815,7 +851,9 @@ async function computeSbtScorecard(req) {
     // lookup below to miss its own data.
     // Each bucket is 15 minutes = 0.25h, regardless of the meter's own
     // sampling interval — simpler and consistent across the fleet.
-    (byMeterDay[k] = byMeterDay[k] || {})[r.day] = +r.on_buckets * 0.25;
+    const metric = metricByMeter[k];
+    const onBuckets = metric === 'voltage' ? +r.voltage_on_buckets : +r.load_on_buckets;
+    (byMeterDay[k] = byMeterDay[k] || {})[r.day] = onBuckets * 0.25;
   });
 
   // Today's average measured load — the real, defensible basis for the
@@ -879,6 +917,7 @@ async function computeSbtScorecard(req) {
 
     return {
       meterId: f.meter_id, feeder: f.feeder_name || f.meter_id, disco: f.disco, band,
+      feederType: f.feeder_type, availabilityMetric: metricByMeter[f.meter_id],
       minHours: need, actualHours, shortfallHours, met,
       consecutiveShortfallDays,
       explanationDue: met === false && consecutiveShortfallDays >= explanationDays,

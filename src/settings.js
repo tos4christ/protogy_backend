@@ -12,6 +12,16 @@ const DEFAULTS = {
   // threshold must be expressed in kV too: 0.05 kV = 50V, preserving the
   // original real-world meaning correctly in the unit actually stored.
   voltage_present_threshold: 0.05,
+  // PROVISIONAL — per the Commission's feeder-type availability letter
+  // (see feederType.js), a Public/Commercial feeder's availability is
+  // measured by load (MW), not current. The letter doesn't state an actual
+  // threshold (that was presumably set in the DisCo meeting it references,
+  // just not in the email forwarded here), so this is a low-bar "is there
+  // measurable load on the feeder" presence test, same role
+  // current_flow_threshold already played before this letter — NOT an
+  // official NERC-published figure. Confirm the real number with NERC/the
+  // MD and update here once known. Expressed in kW (0.5 kW).
+  load_present_threshold_kw: 0.5,
   // Service-Based Tariff (SBT) minimum daily supply hours per NERC Band
   // (NERC Order, effective 3 Apr 2024): A=20h, B=16h, C=12h, D=8h, E=4h.
   sbt_hours_band_a: 20, sbt_hours_band_b: 16, sbt_hours_band_c: 12,
