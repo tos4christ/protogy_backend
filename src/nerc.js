@@ -82,6 +82,16 @@ function filterCond(req, params, alias, keyword = 'AND') {
       cond += ` ${keyword} ${col('state')} = ANY($${params.length})`;
       keyword = 'AND';
     }
+    // A multi-state State NERC office can additionally narrow its own view
+    // to one DisCo operating in their state(s) - always ANDed with the
+    // state restriction above, so it can only narrow further, never widen
+    // past it (a DisCo with no feeders in their state(s) just returns zero
+    // rows). Previously req.query.disco was never read here at all for a
+    // state-scoped account, so the Disco dropdown on every NERC-module page
+    // (Executive Summary, DAR History, Reporting, Performance
+    // Categorization, SBT Scorecard, NERC View) silently did nothing for
+    // State NERC logins.
+    add('disco', 'disco');
   } else {
     add('disco', 'disco');
     add('state', 'state');

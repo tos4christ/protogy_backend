@@ -34,9 +34,24 @@ function scopeOf(user) {
 // returned. A 'disco' scope ignores any client ?disco= entirely - a DisCo
 // account only ever has the one DisCo, so there is nothing legitimate to
 // pick from the client side.
+//
+// `req.query.disco` is honoured for every OTHER scope kind:
+//   - 'full' (protogy_admin/protogy_user/nerc): the client is free to pick
+//     any DisCo, same as today's dropdown UX.
+//   - 'state': a multi-state State NERC office can narrow its own view down
+//     to one DisCo operating in their state(s). This is always ANDed with
+//     the state restriction above, never instead of it, so it can only ever
+//     narrow the result further - it can't be used to escape the account's
+//     state scope (asking for a DisCo that doesn't operate in any of their
+//     states just returns zero rows, never another state's data).
+// Previously this function never looked at req.query.disco at all, so the
+// Disco filter dropdown silently did nothing for every account type -
+// selecting a DisCo sent ?disco=... to the server and the server just
+// never read it.
 function applyScope(req, conds, params, alias = '') {
   const col = (name) => (alias ? `${alias}.${name}` : name);
   const scope = scopeOf(req.user);
+  const reqDisco = req.query.disco;
 
   if (scope.kind === 'disco') {
     params.push(scope.disco);
@@ -56,9 +71,16 @@ function applyScope(req, conds, params, alias = '') {
       params.push(scope.states);
       conds.push(`${col('state')} = ANY($${params.length})`);
     }
+    if (reqDisco && reqDisco !== 'all') {
+      params.push(reqDisco);
+      conds.push(`${col('disco')} = $${params.length}`);
+    }
+  } else if (scope.kind === 'full' && reqDisco && reqDisco !== 'all') {
+    params.push(reqDisco);
+    conds.push(`${col('disco')} = $${params.length}`);
   }
-  // 'full' and 'none' add no restriction here; 'none' should never reach a
-  // list query in practice since requireAuth runs first on every route.
+  // 'none' adds no restriction here; it should never reach a list query in
+  // practice since requireAuth runs first on every route.
   return scope;
 }
 
