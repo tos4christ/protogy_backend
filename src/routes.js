@@ -113,14 +113,20 @@ router.get('/discos', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// List of Tariff Bands in use (for filter dropdowns)
+// List of Tariff Bands in use (for filter dropdowns) — scoped the same way
+// as /discos and /states just above. This previously took `_req` and ran
+// a completely unscoped query across every DisCo's feeders, so the Band
+// dropdown's counts leaked the WHOLE FLEET's totals to every account
+// regardless of their own DisCo/State scope.
 // GET /api/bands
 // ---------------------------------------------------------------------------
-router.get('/bands', ah(async (_req, res) => {
+router.get('/bands', ah(async (req, res) => {
+  const params = [];
+  const conds = ["tariff_band IS NOT NULL", "status <> 'decommissioned'"];
+  applyScope(req, conds, params);
   const { rows } = await pool.query(
     `SELECT tariff_band AS band, count(*) AS feeders FROM meters
-     WHERE tariff_band IS NOT NULL AND status <> 'decommissioned'
-     GROUP BY tariff_band ORDER BY tariff_band`);
+     WHERE ${conds.join(' AND ')} GROUP BY tariff_band ORDER BY tariff_band`, params);
   res.json(rows);
 }));
 
@@ -140,14 +146,20 @@ router.get('/states', ah(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
-// List of Voltage Classes in use (for filter dropdowns)
+// List of Voltage Classes in use (for filter dropdowns) — same scoping fix
+// as /bands above. This is the exact cause of the Executive Summary
+// Voltage Level dropdown showing the fleet-wide "11Kv Feeder" count (e.g.
+// 19, every DisCo's 11kV feeders) instead of the signed-in account's own
+// count (e.g. 2, AEDC's own 11kV feeders): it ran completely unscoped.
 // GET /api/voltage-classes
 // ---------------------------------------------------------------------------
-router.get('/voltage-classes', ah(async (_req, res) => {
+router.get('/voltage-classes', ah(async (req, res) => {
+  const params = [];
+  const conds = ["voltage_class IS NOT NULL", "status <> 'decommissioned'"];
+  applyScope(req, conds, params);
   const { rows } = await pool.query(
     `SELECT voltage_class, count(*) AS feeders FROM meters
-     WHERE voltage_class IS NOT NULL AND status <> 'decommissioned'
-     GROUP BY voltage_class ORDER BY voltage_class`);
+     WHERE ${conds.join(' AND ')} GROUP BY voltage_class ORDER BY voltage_class`, params);
   res.json(rows);
 }));
 
