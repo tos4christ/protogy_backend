@@ -117,7 +117,7 @@ function normalizePayload(raw) {
       apparent_power: numDiv1000(d.Apparent_Power_Inst),
       active_energy: numDiv1000(d.Active_energy_Tot),
       reactive_energy: numDiv1000(d.Reactive_energy_Tot),
-      apparent_energy: numDiv1000(d.Apparent_Energy_Tot),
+      apparent_energy: numDiv1000(d.ApparentEnergyTotal),
       status: num(d.Status), exti_trigger: bool01(d.EXTI_Trigger),
       payver: num(d.Payver) ?? 0,
     };
