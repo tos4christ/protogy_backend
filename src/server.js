@@ -27,7 +27,7 @@ app.use((req, _res, next) => { console.log(req.method, req.url); next(); });
 app.get('/api/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, db: 'up', ingest: ingest.stats() });
+    res.json({ ok: true, db: 'up', ingest: ingest.stats(), dbHealth: pool.lastHealthCheck });
   } catch (e) { res.status(500).json({ ok: false, db: e.message }); }
 });
 

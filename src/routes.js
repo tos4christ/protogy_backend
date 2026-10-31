@@ -404,7 +404,15 @@ router.get('/meters/:id/download', requireMeterInScope, ah(async (req, res) => {
     `attachment; filename="${id}_${from}_to_${to}.csv"`);
   res.write('meter_id,' + cols.join(',') + '\n');
 
-  const client = await pool.connect();
+  const client = await pool.downloadPool.connect();
+  // If the client's connection drops mid-download, res.write() can start
+  // failing silently and the 'drain' event awaited below may never fire
+  // again -- without this guard the loop (and this pool connection) hangs
+  // forever instead of cleaning up. More feeders -> more/bigger exports ->
+  // this is how the pool slowly fills up over time until it's exhausted.
+  let aborted = false;
+  const onAbort = () => { aborted = true; };
+  res.on('close', onAbort);
   try {
     const cursor = client.query(new Cursor(
       `SELECT ${cols.join(',')} FROM readings
@@ -413,7 +421,7 @@ router.get('/meters/:id/download', requireMeterInScope, ah(async (req, res) => {
     const readBatch = () => new Promise((resolve, reject) =>
       cursor.read(5000, (err, rows) => (err ? reject(err) : resolve(rows))));
     let rows;
-    while ((rows = await readBatch()).length > 0) {
+    while (!aborted && (rows = await readBatch()).length > 0) {
       const chunk = rows.map((r) =>
         id + ',' + cols.map((c) => {
           const v = r[c];
@@ -421,11 +429,17 @@ router.get('/meters/:id/download', requireMeterInScope, ah(async (req, res) => {
           if (v instanceof Date) return v.toISOString();
           return String(v);
         }).join(',')).join('\n') + '\n';
-      if (!res.write(chunk)) await new Promise((rs) => res.once('drain', rs));
+      if (!res.write(chunk)) {
+        await new Promise((resolve) => {
+          res.once('drain', resolve);
+          res.once('close', resolve);
+        });
+      }
     }
     cursor.close(() => {});
-    res.end();
+    if (!aborted) res.end();
   } finally {
+    res.removeListener('close', onAbort);
     client.release();
   }
 }));
